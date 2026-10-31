@@ -1,0 +1,10 @@
+# 个人视频与本地数据（不上传）
+视频/
+.thumbcache/
+library.json
+favorites.json
+*.tmp
+
+# 构建产物：便携包 zip 只发布到 GitHub Releases
+便携包/
+__pycache__/
