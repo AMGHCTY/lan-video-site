@@ -1104,18 +1104,18 @@ main{position:relative;z-index:1;max-width:1200px;margin:0 auto;padding:20px 18p
 .ptitle{font-size:17px;font-weight:650;line-height:1.55;word-break:break-all;cursor:pointer;
   display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical;overflow:hidden}
 .ptitle.open{-webkit-line-clamp:unset;display:block}
-.chips2{display:flex;flex-wrap:wrap;gap:8px;margin:14px 0}
+.chips2{display:flex;flex-wrap:wrap;gap:7px;margin:12px 0}
 .tag{font-size:12px;color:var(--dim);background:var(--panel);border:1px solid var(--line);
-  border-radius:999px;padding:5px 12px}
+  border-radius:9px;padding:4px 10px;white-space:nowrap}
 .tag.hl{color:var(--hl-text);border-color:var(--hl-border);background:var(--hl-bg)}
 #restart{background:var(--grad);border:none;color:#fff;border-radius:11px;
-  padding:11px 22px;font-size:14px;font-weight:500;cursor:pointer;
+  padding:10px 18px;font-size:13.5px;font-weight:500;cursor:pointer;
   box-shadow:0 4px 18px rgba(91,140,255,.3)}
 #restart:active{transform:scale(.97)}
 #renameBtn,#favBtn,#dlBtn{background:var(--panel);border:1px solid var(--line2);color:var(--text);
-  border-radius:11px;padding:11px 20px;font-size:14px;cursor:pointer}
+  border-radius:11px;padding:10px 16px;font-size:13.5px;cursor:pointer}
 #renameBtn:active,#favBtn:active,#dlBtn:active{transform:scale(.97)}
-.pact{display:flex;gap:10px;margin:4px 0 6px;flex-wrap:wrap}
+.pact{display:flex;gap:9px;margin:4px 0 6px;flex-wrap:wrap}
 .moreh{margin:26px 0 12px;font-size:14px;font-weight:600;color:var(--text)}
 .moreh span{color:var(--dim);font-weight:400;font-size:12.5px}
 #more{margin-top:0;grid-template-columns:repeat(2,1fr)}
@@ -1225,7 +1225,7 @@ main{position:relative;z-index:1;max-width:1200px;margin:0 auto;padding:20px 18p
       <div class="chips2" id="pchips"></div>
       <div class="pact">
         <button id="restart">↻&nbsp; 从头播放</button>
-        <button id="renameBtn">✏️&nbsp; 重命名</button>
+        <button id="renameBtn">重命名</button>
         <button id="favBtn">☆&nbsp; 收藏</button>
         <button id="dlBtn">⬇&nbsp; 下载</button>
       </div>
@@ -2000,12 +2000,10 @@ function openPlayerByPath(path){
     s.className = "tag" + (hl ? " hl" : "");
     s.textContent = txt; chips.appendChild(s);
   };
-  if(item.size) addTag(fmtSize(item.size));
-  if(item.mtime) addTag(fmtDate(item.mtime));
   const ext = (item.name.split(".").pop()||"").toUpperCase();
-  if(ext) addTag(ext);
   const p0 = getProgress()[path];
   if(p0 && p0.d) addTag("看到 " + Math.round(Math.min(100, p0.t/p0.d*100)) + "%", true);
+  // 其余信息等 /api/info 返回后合并成少量标签（格式·编码·分辨率 / 时长·大小 / 日期）
   $("#restart").style.display = (p0 && p0.t > 5) ? "" : "none";
   $("#player").classList.add("on");
   document.body.classList.add("viewing");
@@ -2093,10 +2091,18 @@ function openPlayerByPath(path){
   };
   // 问服务器播放方式：direct=原生直读；cached=已有转码缓存当普通文件播；否则实时转码直推
   fetch("/api/info?path=" + encodeURIComponent(path)).then(r=>r.json()).then(d=>{
-    if(!d.ok){ v.src = "/video?path=" + encodeURIComponent(path); return; }
-    if(d.res) addTag(d.res);
-    if(d.v && d.v !== "?") addTag("编码 " + d.v.toUpperCase());
-    if(d.dur){ addTag("时长 " + fmtTime(d.dur)); effDur = d.dur; }
+    d = d.ok ? d : {};
+    const spec = [];
+    if(ext) spec.push(ext);
+    if(d.v && d.v !== "?") spec.push(d.v.toUpperCase());
+    if(d.res) spec.push(d.res);
+    if(spec.length) addTag(spec.join(" · "));
+    const meta = [];
+    if(d.dur){ meta.push(fmtTime(d.dur)); effDur = d.dur; }
+    if(item.size) meta.push(fmtSize(item.size));
+    if(meta.length) addTag(meta.join(" · "));
+    if(item.mtime) addTag(fmtDate(item.mtime));
+    if(!d.ok){ v.src = "/video?path=" + encodeURIComponent(path); return; }   // info 失败按原生播
     if(d.mode === "direct" || d.cached){
       v.src = "/video?path=" + encodeURIComponent(path);
       return;
@@ -2104,11 +2110,16 @@ function openPlayerByPath(path){
     streamMode = "trans";
     const p0t = (getProgress()[path] || {}).t || 0;
     transStart = p0t > 5 ? p0t : 0;
-    if(d.encoder) addTag("⚡ 实时转码 · " + d.encoder, true);
+    const enc = d.encoder || "";
+    const encShort = enc.includes("NVENC") ? "NVENC" : enc.includes("QSV") ? "QSV"
+                   : enc.includes("AMF") ? "AMF" : (enc ? "CPU" : "");
+    if(encShort) addTag("⚡ 实时转码 · " + encShort, true);
     v.controls = false;              // 转码流拖动靠重启转码实现，系统进度条不适用 → 自绘进度条
     startTbar();
     v.src = "/video?path=" + encodeURIComponent(path) + "&t=" + Math.round(transStart);
   }).catch(()=>{
+    if(item.size) addTag(fmtSize(item.size));
+    if(item.mtime) addTag(fmtDate(item.mtime));
     v.src = "/video?path=" + encodeURIComponent(path);
   });
   loadMore(path, folder);
