@@ -1,8 +1,10 @@
 # 个人视频与本地数据（不上传）
 视频/
 .thumbcache/
+.transcache/
 library.json
 favorites.json
+.warmcache.json
 *.tmp
 
 # 构建产物：便携包 zip 只发布到 GitHub Releases
