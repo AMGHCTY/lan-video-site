@@ -49,6 +49,60 @@ CONFIG_FILE = os.path.join(SCRIPT_DIR, "library.json")
 THUMB_DIR = os.path.join(SCRIPT_DIR, ".thumbcache")   # 缩略图磁盘缓存
 FAV_FILE = os.path.join(SCRIPT_DIR, "favorites.json")  # 收藏夹数据
 
+# 视频文件句柄池：复用已打开的句柄，减少慢速介质（U 盘）上反复 open 的开销
+_HANDLE_POOL = {}
+_HANDLE_ORDER = []
+_HANDLE_GUARD = threading.Lock()
+POOL_MAX = 6
+
+
+def get_video_handle(fs_path: str):
+    """返回 (文件对象, 该文件的锁)。同一文件的请求排队复用句柄，避免随机读写。"""
+    st = os.stat(fs_path)
+    key = (os.path.abspath(fs_path).lower(), st.st_size, int(st.st_mtime))
+    with _HANDLE_GUARD:
+        ent = _HANDLE_POOL.get(key)
+        if ent is not None:
+            _HANDLE_ORDER.remove(key)
+            _HANDLE_ORDER.append(key)
+            return ent[0], ent[1]
+    f = open(fs_path, "rb")
+    lk = threading.Lock()
+    with _HANDLE_GUARD:
+        if key not in _HANDLE_POOL:            # 双重检查：另一线程可能刚建过
+            _HANDLE_POOL[key] = [f, lk]
+            _HANDLE_ORDER.append(key)
+            while len(_HANDLE_ORDER) > POOL_MAX:
+                old = _HANDLE_ORDER.pop(0)
+                try:
+                    _HANDLE_POOL.pop(old)[0].close()
+                except Exception:
+                    pass
+            return f, lk
+    f.close()
+    ent = _HANDLE_POOL[key]
+    return ent[0], ent[1]
+
+
+def drop_video_handle(fs_path: str):
+    """读盘失败（文件变动/U 盘被拔出）时丢弃池中句柄，下次请求重新打开。"""
+    try:
+        st = os.stat(fs_path)
+        key = (os.path.abspath(fs_path).lower(), st.st_size, int(st.st_mtime))
+    except OSError:
+        return
+    with _HANDLE_GUARD:
+        ent = _HANDLE_POOL.pop(key, None)
+        if ent is not None:
+            try:
+                ent[0].close()
+            except Exception:
+                pass
+            try:
+                _HANDLE_ORDER.remove(key)
+            except ValueError:
+                pass
+
 
 # ================================================================ 视频库（多目录）
 
@@ -601,6 +655,71 @@ class FavStore:
 FAVS = FavStore()
 
 
+# ================================================================ 后台预热
+# Windows Defender 会对"刚拷入可移动磁盘的文件"在首次打开时做全文件扫描，
+# 且 U 盘每次重新插拔后扫描缓存失效。提前在后台把每个视频顺序读一遍：
+# 触发安全扫描 + 填满系统文件缓存，之后播放和缩略图都是秒开。
+
+_WARM_SEM = threading.Semaphore(1)
+WARM_FILE = os.path.join(SCRIPT_DIR, ".warmcache.json")   # 已预热文件的状态记录
+
+
+def warm_video_file(fs_path: str):
+    try:
+        with open(fs_path, "rb") as f:
+            while True:
+                if not f.read(CHUNK):
+                    break
+    except OSError:
+        pass
+
+
+def warm_library(roots, label=""):
+    with _WARM_SEM:   # 同时只跑一个预热任务
+        state = {}
+        if os.path.isfile(WARM_FILE):
+            try:
+                with open(WARM_FILE, encoding="utf-8") as f:
+                    state = json.load(f)
+            except Exception:
+                state = {}
+        n, total, skipped, new_state = 0, 0, 0, {}
+        for entry in roots:
+            for dirpath, dirnames, filenames in os.walk(entry["path"]):
+                dirnames[:] = [d for d in dirnames if not d.startswith((".", "$"))]
+                for name in filenames:
+                    if not is_video(name):
+                        continue
+                    p = os.path.join(dirpath, name)
+                    try:
+                        st = os.stat(p)
+                    except OSError:
+                        continue
+                    key = p.lower()
+                    sig = f"{int(st.st_mtime)}:{st.st_size}"
+                    new_state[key] = sig
+                    if state.get(key) == sig:
+                        skipped += 1
+                        try:   # 轻触一下，维持扫描/缓存状态
+                            with open(p, "rb") as f:
+                                f.read(65536)
+                        except OSError:
+                            pass
+                        continue
+                    warm_video_file(p)
+                    total += st.st_size
+                    n += 1
+        try:
+            with open(WARM_FILE, "w", encoding="utf-8") as f:
+                json.dump(new_state, f, ensure_ascii=False)
+        except Exception:
+            pass
+        msg = f"{skipped} 个已缓存跳过"
+        if n:
+            msg += f"，新/变更 {n} 个 / {total/1048576:.0f}MB 已预热"
+        print(f"  ♨ 预热完成（{label}）：{msg}", flush=True)
+
+
 # ================================================================ 页面
 
 PAGE = r"""<!DOCTYPE html>
@@ -987,6 +1106,7 @@ const tdb = {
 };
 
 const thumbQueue = []; let thumbBusy = false;
+let thumbPaused = false;   // 播放中暂停生成缩略图，把磁盘带宽让给播放
 const thumbObserver = new IntersectionObserver(entries=>{
   for(const e of entries){
     if(e.isIntersecting && !e.target.dataset.queued){
@@ -998,7 +1118,7 @@ const thumbObserver = new IntersectionObserver(entries=>{
 },{rootMargin:"150px"});
 
 function pumpThumbs(){
-  if(thumbBusy || !thumbQueue.length) return;
+  if(thumbPaused || thumbBusy || !thumbQueue.length) return;
   thumbBusy = true;
   const box = thumbQueue.shift();
   makeThumb(box).finally(()=>{ thumbBusy = false; pumpThumbs(); });
@@ -1583,6 +1703,7 @@ function openPlayerByPath(path){
   };
   v.onseeked = ()=> drawVblur(true);
   v.onplay = ()=>{
+    thumbPaused = true;          // 播放优先：缩略图生成让出磁盘带宽
     setVwrapCollapsed(false);
     $("#player").classList.add("playing");
     updatePausedView();
@@ -1590,11 +1711,15 @@ function openPlayerByPath(path){
   v.onpause = ()=>{
     saveNow();
     drawVblur(true);
+    thumbPaused = false;
+    pumpThumbs();
     $("#player").classList.remove("playing");   // 暂停后取消吸顶，下滑可收起视频区
     updatePausedView();
   };
   v.onended = ()=>{
     if(!curItem) return;
+    thumbPaused = false;
+    pumpThumbs();
     const p = getProgress(); delete p[curItem.path]; setProgress(p);
   };
   v.src = "/video?path=" + encodeURIComponent(path);
@@ -1783,6 +1908,8 @@ function stopPlayback(){
   saveCurProgress();
   const v = $("#v");
   v.pause();
+  thumbPaused = false;
+  pumpThumbs();
   v.onloadedmetadata = v.ontimeupdate = v.onended = null;
   v.onplay = v.onpause = v.onseeked = null;
   v.removeAttribute("src"); v.load();
@@ -1985,6 +2112,7 @@ class Handler(BaseHTTPRequestHandler):
                     except ValueError as e:
                         return self._json({"ok": False, "error": str(e)})
                     LIB.save()
+                    threading.Thread(target=warm_library, args=([entry], f"新目录 {entry['alias']}"), daemon=True).start()
                     return self._json({"ok": True, "entry": entry, "dirs": LIB.roots()})
                 if action == "remove":
                     ok = LIB.remove(str(body.get("alias") or ""))
@@ -2156,11 +2284,13 @@ class Handler(BaseHTTPRequestHandler):
 
         try:
             if fss is not None:
-                with open(fs_path, "rb") as f:
+                f, lk = get_video_handle(fs_path)
+                with lk:
                     for piece in iter_faststart_data(fss, f, start, length):
                         self.wfile.write(piece)
             else:
-                with open(fs_path, "rb") as f:
+                f, lk = get_video_handle(serve_path)
+                with lk:
                     f.seek(start)
                     remaining = length
                     while remaining > 0:
@@ -2169,8 +2299,10 @@ class Handler(BaseHTTPRequestHandler):
                             break
                         self.wfile.write(chunk)
                         remaining -= len(chunk)
-        except (BrokenPipeError, ConnectionResetError):
+        except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError):
             pass  # 客户端中断（拖进度条/关闭页面）
+        except OSError:
+            drop_video_handle(fs_path)   # 读盘失败（文件变动/介质被拔出），弃用句柄
 
 
 class VideoServer(ThreadingHTTPServer):
@@ -2272,6 +2404,8 @@ def console_thread(server):
                 entry = LIB.add(os.path.abspath(p))
                 LIB.save()
                 print(f"  已添加：{entry['alias']}  ←  {entry['path']}", flush=True)
+                if ARGS and not ARGS.no_warmup:
+                    threading.Thread(target=warm_library([entry], f"新目录 {entry['alias']}"), daemon=True).start()
             except ValueError as e:
                 print(f"  {e}", flush=True)
 
@@ -2283,6 +2417,7 @@ def main():
                         help="添加视频目录（可多次使用）")
     parser.add_argument("--port", type=int, default=8080, help="监听端口（默认 8080）")
     parser.add_argument("--no-open", action="store_true", help="启动后不自动打开浏览器")
+    parser.add_argument("--no-warmup", action="store_true", help="关闭启动时的视频预热")
     ARGS = parser.parse_args()
 
     try:
@@ -2318,6 +2453,8 @@ def main():
         threading.Timer(0.6, webbrowser.open, (f"http://localhost:{port}/",)).start()
 
     threading.Thread(target=console_thread, args=(server,), daemon=True).start()
+    if not ARGS.no_warmup:
+        threading.Thread(target=warm_library, args=(LIB.roots(), "启动预热"), daemon=True).start()
     try:
         server.serve_forever()
     except KeyboardInterrupt:
