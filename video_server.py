@@ -263,14 +263,16 @@ def probe_file(fs_path: str) -> dict:
 
 
 def gen_thumb_ffmpeg(fs_path: str, out_path: str) -> bool:
-    """用 ffmpeg 从视频里截一帧存为 JPEG（浏览器解不了的格式用）。"""
+    """用 ffmpeg 截一帧存为 JPEG（320x180 居中裁剪，与卡片比例一致，竖屏不变形）。"""
     ff = get_ffmpeg()
     if not ff:
         return False
     for ss in ("3", "0"):
         try:
             r = subprocess.run([ff, "-hide_banner", "-loglevel", "error", "-ss", ss,
-                                "-i", fs_path, "-frames:v", "1", "-q:v", "4", "-y", out_path],
+                                "-i", fs_path, "-frames:v", "1",
+                                "-vf", "scale=320:180:force_original_aspect_ratio=increase,crop=320:180",
+                                "-q:v", "4", "-y", out_path],
                                capture_output=True, timeout=90)
             if r.returncode == 0 and os.path.isfile(out_path) and os.path.getsize(out_path) > 0:
                 return True
@@ -1303,8 +1305,12 @@ const tdb = {
     if(this._p) return this._p;
     this._p = new Promise(res=>{
       try{
-        const rq = indexedDB.open("lan_video_thumbs", 1);
-        rq.onupgradeneeded = ()=> rq.result.createObjectStore("thumbs");
+        const rq = indexedDB.open("lan_video_thumbs", 2);
+        rq.onupgradeneeded = ()=>{
+          const db = rq.result;
+          if(db.objectStoreNames.contains("thumbs")) db.deleteObjectStore("thumbs");
+          db.createObjectStore("thumbs");   // v2：清掉旧版被拉伸的缓存图，全部重新取
+        };
         rq.onsuccess = ()=>{ this.db = rq.result; res(this.db); };
         rq.onerror = ()=> res(null);
       }catch(e){ res(null); }
@@ -1351,12 +1357,24 @@ function pumpThumbs(){
 // 看门狗：任何原因导致的队列停顿都会被自动拉起
 setInterval(()=>{ pumpThumbs(); }, 2500);
 
+function drawThumbCover(canvas, src, sw, sh){
+  // 等比缩放到铺满 320x180 再居中裁剪：竖屏/方图不会变形
+  const W = 320, H = 180;
+  canvas.width = W; canvas.height = H;
+  const ctx = canvas.getContext("2d");
+  ctx.fillStyle = "#000";
+  ctx.fillRect(0, 0, W, H);
+  if(sw && sh){
+    const s = Math.max(W/sw, H/sh);
+    ctx.drawImage(src, (W-sw*s)/2, (H-sh*s)/2, sw*s, sh*s);
+  }
+}
+
 function drawThumbFromURL(box, url, dur){
   const canvas = box.querySelector("canvas");
   const img = new Image();
   img.onload = ()=>{
-    canvas.width = 320; canvas.height = 180;
-    canvas.getContext("2d").drawImage(img, 0, 0, 320, 180);
+    drawThumbCover(canvas, img, img.naturalWidth, img.naturalHeight);
     canvas.style.display = "block";
   };
   img.onerror = ()=>{};
@@ -1389,8 +1407,7 @@ function makeThumb(box){
         await new Promise(res=>{
           const img = new Image();
           img.onload = ()=>{
-            canvas.width = 320; canvas.height = 180;
-            canvas.getContext("2d").drawImage(img, 0, 0, 320, 180);
+            drawThumbCover(canvas, img, img.naturalWidth, img.naturalHeight);
             canvas.style.display = "block";
             res();
           };
@@ -1438,16 +1455,7 @@ function makeThumb(box){
     v.onseeked = ()=>{
       clearTimeout(timer);
       try{
-        const W = 320, H = 180;
-        canvas.width = W; canvas.height = H;
-        const ctx = canvas.getContext("2d");
-        const vw = v.videoWidth, vh = v.videoHeight;
-        if(vw && vh){
-          const s = Math.max(W/vw, H/vh);   // 等比缩放到铺满，再居中裁剪
-          ctx.drawImage(v, (W-vw*s)/2, (H-vh*s)/2, vw*s, vh*s);
-        }else{
-          ctx.drawImage(v, 0, 0, W, H);
-        }
+        drawThumbCover(canvas, v, v.videoWidth, v.videoHeight);
         done(true);
       }catch(e){ done(false); }
     };
