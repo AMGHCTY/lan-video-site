@@ -2083,17 +2083,6 @@ class Handler(BaseHTTPRequestHandler):
                     return self._json({"ok": True, "folders": folders, "fids": fids})
                 FAVS.validate()   # 清掉源文件已删除的收藏
                 return self._json({"ok": True, "folders": FAVS.folders_with_counts()})
-            elif route == "/dbg-open":
-                p = self._params().get("path", "")
-                fs = resolve(p)
-                t0 = time.perf_counter()
-                try:
-                    with open(fs, "rb") as f:
-                        n = len(f.read(262144))
-                    self._json({"ok": True, "ms": round((time.perf_counter()-t0)*1000), "n": n})
-                except Exception as e:
-                    self._json({"ok": False, "err": f"{type(e).__name__}: {e}",
-                                "ms": round((time.perf_counter()-t0)*1000)})
             elif route == "/video":
                 self.stream_video()
             elif route == "/thumb":
@@ -2315,7 +2304,6 @@ class Handler(BaseHTTPRequestHandler):
             pass  # 客户端中断（拖进度条/关闭页面）
         except Exception:
             pass  # 响应头已发出（如读盘被安全扫描阻塞后失败），只能断开连接
-        print(f"[dbg] done T{threading.get_ident()} 实发={sent if 'sent' in dir() else '-'}", flush=True)
 
 
 class VideoServer(ThreadingHTTPServer):
