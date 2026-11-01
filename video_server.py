@@ -1119,7 +1119,7 @@ main{position:relative;z-index:1;max-width:1200px;margin:0 auto;padding:20px 18p
   border-radius:11px;padding:10px 16px;font-size:13.5px;cursor:pointer}
 #renameBtn:active,#favBtn:active,#dlBtn:active{transform:scale(.97)}
 .pact{display:flex;gap:9px;margin:4px 0 6px;flex-wrap:wrap}
-@media (max-width:500px){
+@media (max-width:640px){
   .pact{gap:8px}
   .pact button{flex:1 1 0;min-width:0;padding:10px 2px;font-size:12.5px;white-space:nowrap}
   .pact #restart{flex-grow:1.18}   /* 标签最长的按钮多分一点宽度，避免文字溢出 */
@@ -1193,7 +1193,7 @@ main{position:relative;z-index:1;max-width:1200px;margin:0 auto;padding:20px 18p
   <div class="hrow">
     <div class="brand" id="brandHome" title="回到首页">
       <div class="logo"><svg viewBox="0 0 24 24" aria-hidden="true"><path fill="#fff" d="M18 4l2 4h-3l-2-4h-2l2 4h-3l-2-4H8l2 4H7L5 4H4c-1.1 0-2 .9-2 2v12c0 1.1.9 2 2 2h16c1.1 0 2-.9 2-2V4h-4z"/></svg></div>
-      <div><h1>局域网视频站<small>LAN VIDEO</small></h1></div>
+      <div><h1>局域网视频站<small>LAN VIDEO · v1.1.0</small></h1></div>
     </div>
     <input id="search" type="search" placeholder="搜索视频…" autocomplete="off">
     <button id="themeBtn" title="切换白天/黑夜模式">☀️</button>
