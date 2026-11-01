@@ -1109,9 +1109,9 @@ main{position:relative;z-index:1;max-width:1200px;margin:0 auto;padding:20px 18p
   padding:11px 22px;font-size:14px;font-weight:500;cursor:pointer;
   box-shadow:0 4px 18px rgba(91,140,255,.3)}
 #restart:active{transform:scale(.97)}
-#renameBtn,#favBtn{background:var(--panel);border:1px solid var(--line2);color:var(--text);
+#renameBtn,#favBtn,#dlBtn{background:var(--panel);border:1px solid var(--line2);color:var(--text);
   border-radius:11px;padding:11px 20px;font-size:14px;cursor:pointer}
-#renameBtn:active,#favBtn:active{transform:scale(.97)}
+#renameBtn:active,#favBtn:active,#dlBtn:active{transform:scale(.97)}
 .pact{display:flex;gap:10px;margin:4px 0 6px;flex-wrap:wrap}
 .moreh{margin:26px 0 12px;font-size:14px;font-weight:600;color:var(--text)}
 .moreh span{color:var(--dim);font-weight:400;font-size:12.5px}
@@ -1150,6 +1150,9 @@ main{position:relative;z-index:1;max-width:1200px;margin:0 auto;padding:20px 18p
 #dlgi{width:100%;background:var(--bg);border:1px solid var(--line);border-radius:10px;
   color:var(--text);padding:11px 13px;font-size:14px;outline:none;margin-bottom:16px}
 #dlgi:focus{border-color:var(--acc);box-shadow:0 0 0 3px rgba(109,155,255,.15)}
+.upbtn{margin-left:12px;background:var(--panel);border:1px solid var(--line2);color:var(--acc);
+  border-radius:999px;padding:6px 14px;font-size:12.5px;cursor:pointer;vertical-align:middle}
+.upbtn:active{transform:scale(.96)}
 .dlgb{display:flex;gap:10px;justify-content:flex-end}
 .dlgb button{border-radius:10px;padding:10px 20px;font-size:14px;cursor:pointer;border:1px solid var(--line)}
 #dlgn{background:none;color:var(--dim)}
@@ -1221,6 +1224,7 @@ main{position:relative;z-index:1;max-width:1200px;margin:0 auto;padding:20px 18p
         <button id="restart">↻&nbsp; 从头播放</button>
         <button id="renameBtn">✏️&nbsp; 重命名</button>
         <button id="favBtn">☆&nbsp; 收藏</button>
+        <button id="dlBtn">⬇&nbsp; 下载</button>
       </div>
       <div class="moreh" id="moreh" style="display:none"></div>
       <div class="grid" id="more" style="display:none"></div>
@@ -1600,7 +1604,7 @@ function addDir(){
         headers:{"Content-Type":"application/json"},
         body: JSON.stringify({action:"add", path:p})});
       const d = await r.json();
-      if(d.ok){ toast("已添加目录：" + d.entry.alias); openDir(""); }
+      if(d.ok){ toast("已添加目录：" + d.entry.alias + (d.created ? "（目录不存在，已创建）" : "")); openDir(""); }
       else toast(d.error || "添加失败");
     },
   });
@@ -1678,7 +1682,14 @@ async function renderBrowse(data){
     if(isRoot) grid.appendChild(addDirCard());
   }
   if(data.videos.length){
-    grid.appendChild(wideSection("视频", data.videos.length + " 个"));
+    const sec = wideSection("视频", data.videos.length + " 个");
+    if(!isRoot){
+      const up = document.createElement("button");
+      up.className = "upbtn"; up.textContent = "⬆ 上传视频到这里";
+      up.addEventListener("click", ()=>pickUpload(data.cur));
+      sec.appendChild(up);
+    }
+    grid.appendChild(sec);
     data.videos.forEach(v=>grid.appendChild(videoCard(v)));
   }
   if(!data.folders.length && !data.videos.length){
@@ -1686,8 +1697,50 @@ async function renderBrowse(data){
     box.innerHTML = isRoot
       ? "还没有视频目录<br>点上方 <b>＋ 添加视频目录</b>，或把视频放进服务目录下的「视频」文件夹"
       : "这个文件夹里没有视频";
+    if(!isRoot){
+      const up = document.createElement("button");
+      up.className = "upbtn"; up.textContent = "⬆ 上传视频到这里";
+      up.addEventListener("click", ()=>pickUpload(data.cur));
+      box.appendChild(document.createElement("br"));
+      box.appendChild(up);
+    }
   }
   pumpThumbs();
+}
+
+/* ---------------- 上传视频到当前文件夹 ---------------- */
+function pickUpload(dir){
+  const inp = document.createElement("input");
+  inp.type = "file";
+  inp.accept = "video/*,.mp4,.mkv,.avi,.ts,.wmv,.mov,.flv,.webm,.m4v,.mpg,.mpeg";
+  inp.multiple = true;
+  inp.addEventListener("change", ()=>{
+    [...inp.files].forEach((f, i)=>setTimeout(()=>uploadFile(dir, f), i * 800));
+  });
+  inp.click();
+}
+function uploadFile(dir, file){
+  toast(`上传中 0%：${file.name}`);
+  const xhr = new XMLHttpRequest();
+  xhr.open("POST", "/api/upload?dir=" + encodeURIComponent(dir || "") +
+                    "&name=" + encodeURIComponent(file.name));
+  xhr.setRequestHeader("Content-Type", "application/octet-stream");
+  xhr.upload.addEventListener("progress", e=>{
+    if(e.lengthComputable) toast(`上传中 ${Math.round(e.loaded/e.total*100)}%：${file.name}`);
+  });
+  xhr.addEventListener("load", ()=>{
+    if(xhr.status === 200){
+      const d = JSON.parse(xhr.responseText);
+      toast("已上传：" + (d.name || file.name));
+      openDir(curDir);                 // 刷新当前文件夹列表
+    }else{
+      let msg = "上传失败";
+      try{ msg = JSON.parse(xhr.responseText).error || msg; }catch(e){}
+      toast(`${msg}：${file.name}`);
+    }
+  });
+  xhr.addEventListener("error", ()=>toast(`上传失败（网络中断）：${file.name}`));
+  xhr.send(file);
 }
 
 function showSearch(list, q){
@@ -2344,6 +2397,15 @@ $("#restart").addEventListener("click", ()=>{
   toast("从头开始播放");
 });
 
+$("#dlBtn").addEventListener("click", ()=>{
+  if(!curItem) return;
+  const a = document.createElement("a");
+  a.href = "/video?path=" + encodeURIComponent(curItem.path) + "&dl=1";   // 始终下载原始文件
+  a.download = curItem.name;
+  document.body.appendChild(a); a.click(); a.remove();
+  toast("开始下载：" + curItem.name);
+});
+
 /* ---------------- 路由 ---------------- */
 function refreshRoute(){
   const h = location.hash;
@@ -2523,6 +2585,8 @@ class Handler(BaseHTTPRequestHandler):
     def do_POST(self):
         route = urllib.parse.urlsplit(self.path).path
         try:
+            if route == "/api/upload":
+                return self.put_upload()
             if route == "/api/dirs":
                 body = self._body_json()
                 action = body.get("action")
@@ -2531,15 +2595,22 @@ class Handler(BaseHTTPRequestHandler):
                     if not raw:
                         return self._json({"ok": False, "error": "路径为空"})
                     p = os.path.abspath(os.path.expanduser(raw))
+                    created = False
                     if not os.path.isdir(p):
-                        return self._json({"ok": False, "error": "文件夹不存在：" + p})
+                        if not os.path.isabs(raw):
+                            return self._json({"ok": False, "error": "请输入完整路径（如 E:\\视频\\新番）"})
+                        try:
+                            os.makedirs(p, exist_ok=True)   # 主页添加：目录不存在就直接建
+                            created = True
+                        except OSError as e:
+                            return self._json({"ok": False, "error": f"无法创建目录：{e}"})
                     try:
                         entry = LIB.add(p)
                     except ValueError as e:
                         return self._json({"ok": False, "error": str(e)})
                     LIB.save()
                     threading.Thread(target=warm_library, args=([entry], f"新目录 {entry['alias']}"), daemon=True).start()
-                    return self._json({"ok": True, "entry": entry, "dirs": LIB.roots()})
+                    return self._json({"ok": True, "entry": entry, "created": created, "dirs": LIB.roots()})
                 if action == "remove":
                     ok = LIB.remove(str(body.get("alias") or ""))
                     LIB.save()
@@ -2678,6 +2749,47 @@ class Handler(BaseHTTPRequestHandler):
             return self._error(500, f"save failed: {e}")
         self._json({"ok": True})
 
+    def put_upload(self):
+        """接收网页上传的视频：目标必须是库内目录，流式写盘，重名自动加序号。"""
+        params = self._params()
+        fs_dir = resolve(params.get("dir", ""))
+        if fs_dir is None or not os.path.isdir(fs_dir):
+            return self._error(400, "目标目录无效（须为播放目录内的文件夹）")
+        name = os.path.basename(params.get("name", "")).strip().lstrip(".")
+        if not name:
+            return self._error(400, "缺少文件名")
+        try:
+            n = int(self.headers.get("Content-Length") or 0)
+        except ValueError:
+            n = 0
+        if n <= 0:
+            return self._error(400, "空文件")
+        base, ext = os.path.splitext(name)
+        cand = os.path.join(fs_dir, name)
+        i = 2
+        while os.path.exists(cand):
+            cand = os.path.join(fs_dir, f"{base} ({i}){ext}")
+            i += 1
+        tmp = cand + ".uploading"
+        try:
+            done = 0
+            with open(tmp, "wb") as f:
+                while done < n:
+                    chunk = self.rfile.read(min(1048576, n - done))
+                    if not chunk:
+                        raise IOError("连接中断")
+                    f.write(chunk)
+                    done += len(chunk)
+            os.replace(tmp, cand)
+        except Exception:
+            try:
+                os.remove(tmp)
+            except OSError:
+                pass
+            return self._error(500, "上传失败（连接中断或磁盘写入出错）")
+        return self._json({"ok": True, "name": os.path.basename(cand),
+                           "size": n, "path": params.get("dir", "").rstrip("/") + "/" + os.path.basename(cand)})
+
     # ---------- 视频流：能直接播的直读（支持 Range），不能的实时转码直推 ----------
     def stream_video(self):
         params = self._params()
@@ -2691,6 +2803,7 @@ class Handler(BaseHTTPRequestHandler):
         # 兼容模式：客户端解不了画面（有声无画）时强制走转码
         if params.get("force") == "1" and mode == "direct" and get_ffmpeg():
             mode = "transcode"
+        dl = params.get("dl") == "1"   # 下载原文件：不走转码、加附件头
         t_start = 0.0
         try:
             t_start = max(0.0, float(params.get("t") or 0))
@@ -2698,7 +2811,8 @@ class Handler(BaseHTTPRequestHandler):
             pass
 
         # ① 浏览器播不了的格式：已有完整转码缓存就当普通文件播，否则实时转码直推
-        if mode != "direct":
+        #   （下载 dl=1 时不转码、不重排，直接发原文件）
+        if mode != "direct" and not dl:
             if not get_ffmpeg():
                 return self._error(501, "未检测到 ffmpeg，无法播放此格式")
             key = thumb_key(fs_path)
@@ -2711,9 +2825,10 @@ class Handler(BaseHTTPRequestHandler):
         else:
             # moov 在尾部的 mp4：用内存里的虚拟 faststart 视图，不写任何缓存文件
             serve_path = fs_path
-            fss = get_faststart(fs_path) if ext in FASTSTART_EXTS else None
+            fss = None if dl else (get_faststart(fs_path) if ext in FASTSTART_EXTS else None)
         size = os.path.getsize(serve_path)
-        ctype = "video/mp4" if mode != "direct" else VIDEO_EXTS.get(ext, "application/octet-stream")
+        ctype = ("application/octet-stream" if dl else
+                 "video/mp4" if mode != "direct" else VIDEO_EXTS.get(ext, "application/octet-stream"))
 
         start, end, status = 0, size - 1, 200
         range_header = self.headers.get("Range")
@@ -2739,6 +2854,12 @@ class Handler(BaseHTTPRequestHandler):
         length = end - start + 1 if size > 0 else 0
         self.send_response(status)
         self.send_header("Content-Type", ctype)
+        if dl:
+            fname = os.path.basename(fs_path)
+            self.send_header(
+                "Content-Disposition",
+                'attachment; filename="%s"; filename*=UTF-8\'\'%s'
+                % (fname.encode("ascii", "replace").decode(), urllib.parse.quote(fname)))
         self.send_header("Accept-Ranges", "bytes")
         self.send_header("Content-Length", str(length))
         if status == 206:
@@ -2860,9 +2981,10 @@ def lan_ips() -> list[str]:
 
 HELP_TEXT = """
   命令：
-    直接粘贴文件夹路径回车  添加该文件夹为播放目录
+    直接粘贴文件夹路径回车  添加该文件夹为播放目录（不存在会自动创建）
     ls                    查看当前播放目录列表
     rm 别名                移除某个目录（不删除文件）
+    port 端口号            换一个端口监听（如 port 9000，旧端口立即失效）
     stat                  状态：目录、视频数、缓存占用
     cc                    清空缩略图/转码缓存与预热记录（浏览网页时自动重建）
     warm                  立即预热一遍全部目录（提前读文件，降低首次打开延迟）
@@ -2871,9 +2993,13 @@ HELP_TEXT = """
     help                  显示本帮助
 """
 
+_NEXT_SERVER = None              # port 命令换端口时暂存新 server，主循环接管
+_ACTIVE = {"server": None}       # 当前正在服务的 server（open/q 用）
+
 
 def console_thread(server):
-    """控制台交互线程：可以随时在这里添加/移除目录、退出服务。"""
+    """控制台交互线程：可以随时在这里添加/移除目录、换端口、退出服务。"""
+    _ACTIVE["server"] = server
     while True:
         try:
             line = input("视频站> ").strip()
@@ -2884,7 +3010,9 @@ def console_thread(server):
         low = line.lower()
         if low in ("q", "quit", "exit", "退出"):
             print("  正在停止服务…", flush=True)
-            threading.Thread(target=server.shutdown, daemon=True).start()
+            srv = _ACTIVE["server"]
+            if srv:
+                threading.Thread(target=srv.shutdown, daemon=True).start()
             return
         if low in ("help", "?", "h", "帮助"):
             print(HELP_TEXT, flush=True)
@@ -2895,6 +3023,32 @@ def console_thread(server):
                 print("  （还没有目录）", flush=True)
             for d in roots:
                 print(f"  {d['alias']}  ←  {d['path']}", flush=True)
+            continue
+        if low.startswith(("port ", "端口 ")) or low in ("port", "端口"):
+            arg = line.split(None, 1)[1].strip() if " " in line else ""
+            try:
+                want = int(arg)
+                if not (1 <= want <= 65535):
+                    raise ValueError
+            except ValueError:
+                print("  用法：port 端口号（如 port 9000）", flush=True)
+                continue
+            port = find_free_port(want)
+            try:
+                nsrv = VideoServer(("0.0.0.0", port), Handler)
+            except OSError as e:
+                print(f"  端口 {want} 无法监听：{e}", flush=True)
+                continue
+            global _NEXT_SERVER
+            _NEXT_SERVER = nsrv
+            _ACTIVE["server"].shutdown()   # 主循环退出旧端口后接管新端口
+            _ACTIVE["server"] = nsrv
+            print(f"  已切换到端口 {port}" + ("（请求的端口被占用，自动顺延）" if port != want else ""),
+                  flush=True)
+            ips = lan_ips()
+            print(f"  本机访问  http://localhost:{port}/", flush=True)
+            for ip in ips:
+                print(f"  手机访问  ➜  http://{ip}:{port}/", flush=True)
             continue
         if low in ("stat", "状态"):
             for d in LIB.roots():
@@ -2942,7 +3096,9 @@ def console_thread(server):
                 print("  （还没有目录）", flush=True)
             continue
         if low in ("open", "打开"):
-            webbrowser.open(f"http://localhost:{server.server_address[1]}/")
+            srv = _ACTIVE["server"]
+            if srv:
+                webbrowser.open(f"http://localhost:{srv.server_address[1]}/")
             continue
         if low.startswith(("rm ", "del ", "移除 ")):
             alias = line.split(None, 1)[1].strip()
@@ -2955,8 +3111,22 @@ def console_thread(server):
         # 其余输入当作路径处理
         p = line.strip('"').strip("'")
         if not os.path.exists(p):
-            print("  无法识别的命令或路径不存在。输入 help 查看帮助。", flush=True)
-        elif not os.path.isdir(p):
+            if not os.path.isabs(p):
+                print("  无法识别的命令或路径不存在。输入 help 查看帮助。", flush=True)
+                continue
+            try:
+                os.makedirs(p, exist_ok=True)   # 目录不存在：直接创建
+            except OSError as e:
+                print(f"  无法创建目录 {p}：{e}", flush=True)
+                continue
+            try:
+                entry = LIB.add(os.path.abspath(p))
+                LIB.save()
+                print(f"  目录不存在，已创建并添加：{entry['alias']}  ←  {entry['path']}", flush=True)
+            except ValueError as e:
+                print(f"  {e}", flush=True)
+            continue
+        if not os.path.isdir(p):
             print("  这不是一个文件夹。", flush=True)
         else:
             try:
@@ -2971,7 +3141,7 @@ def console_thread(server):
 
 
 def main():
-    global ARGS
+    global ARGS, _NEXT_SERVER
     parser = argparse.ArgumentParser(description="局域网视频站")
     parser.add_argument("--dir", action="append", default=None, metavar="目录",
                         help="添加视频目录（可多次使用）")
@@ -3020,13 +3190,28 @@ def main():
     if not ARGS.no_warmup:
         threading.Thread(target=warm_library, args=(LIB.roots(), "启动预热"), daemon=True).start()
     threading.Thread(target=pick_video_encoder, daemon=True).start()
+
+    # 主循环：serve_forever 返回 = q 退出 或 port 命令换端口（_NEXT_SERVER 接管）
+    _ACTIVE["server"] = server
     try:
-        server.serve_forever()
-    except KeyboardInterrupt:
-        pass
+        while True:
+            try:
+                server.serve_forever()
+            except KeyboardInterrupt:
+                break
+            server.server_close()
+            nxt = _NEXT_SERVER
+            if nxt is None:
+                break
+            server = nxt
+            _ACTIVE["server"] = server
+            _NEXT_SERVER = None
     finally:
         print("\n已停止服务。")
-        server.server_close()
+        try:
+            server.server_close()
+        except Exception:
+            pass
 
 
 if __name__ == "__main__":
