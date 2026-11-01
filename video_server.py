@@ -1940,7 +1940,7 @@ function openPlayerByPath(path){
   $("#player").classList.add("on");
   document.body.classList.add("viewing");
   document.body.style.overflow = "hidden";
-  setVwrapCollapsed(false);
+  forceExpandVwrap();
   $("#pscroll").scrollTop = 0;
 
   v.onerror = ()=>{
@@ -2004,7 +2004,7 @@ function openPlayerByPath(path){
   };
   v.onplay = ()=>{
     thumbPaused = true;          // 播放优先：缩略图生成让出磁盘带宽
-    setVwrapCollapsed(false);
+    forceExpandVwrap();          // 播放中视频区必须可见：无条件展开，不搞动画
     $("#player").classList.add("playing");
     updatePausedView();
   };
@@ -2122,10 +2122,20 @@ $("#v").addEventListener("click", ()=>{
 
 /* ---------------- 暂停浏览：向下滚动时平滑收起视频区，方便逛宫格 ---------------- */
 let vwrapCollapsed = false;
+const vwrapEl = document.querySelector(".vwrap");
+function forceExpandVwrap(){
+  // 播放/打开新视频时无条件展开：清掉内联 height/opacity，避免
+  // 「0 高度时量到 0 → 写死 0 → 无 transition 收尾 → 永久不可见」的死状态
+  vwrapCollapsed = false;
+  vwrapEl.style.display = "";
+  vwrapEl.style.height = "";
+  vwrapEl.style.opacity = "";
+  $("#resumePill").classList.remove("show");
+}
 function setVwrapCollapsed(c){
   if(vwrapCollapsed === c) return;
   vwrapCollapsed = c;
-  const vw = document.querySelector(".vwrap");
+  const vw = vwrapEl;
   vw.style.overflow = "hidden";
   if(c){
     vw.style.height = vw.scrollHeight + "px";          // 先钉住当前高度
@@ -2140,6 +2150,8 @@ function setVwrapCollapsed(c){
     requestAnimationFrame(()=>requestAnimationFrame(()=>{
       vw.style.height = vw.scrollHeight + "px";        // 从 0 平滑展开
       vw.style.opacity = "1";
+      // 兜底：过渡被打断（切后台/快速操作）时也要恢复自适应高度
+      setTimeout(()=>{ if(!vwrapCollapsed){ vw.style.height = ""; vw.style.opacity = ""; } }, 450);
     }));
   }
 }
@@ -2304,7 +2316,7 @@ function stopPlayback(){
   vblur.style.display = "none";
   $("#player").classList.remove("on", "playing");
   document.body.classList.remove("viewing");
-  setVwrapCollapsed(false);
+  forceExpandVwrap();
   $("#resumePill").classList.remove("show");
   document.body.style.overflow = "";
   curItem = null;
