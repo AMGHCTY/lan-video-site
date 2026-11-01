@@ -252,8 +252,8 @@ def probe_file(fs_path: str) -> dict:
                 m = re.search(r"Duration:\s*(\d+):(\d+):(\d+\.?\d*)", line)
                 if m:
                     dur = int(m.group(1)) * 3600 + int(m.group(2)) * 60 + float(m.group(3))
-    except Exception:
-        pass
+    except Exception as e:
+        print(f"  [probe] {os.path.basename(fs_path)[:40]} -> {type(e).__name__}: {e}", flush=True)
     with _ENC_LOCK:
         _PROBE_CACHE[key] = {"v": v, "a": a, "dur": dur}
         return _PROBE_CACHE[key]
@@ -322,81 +322,34 @@ def pick_video_encoder():
     return chosen
 
 
-def start_transcode_job(fs_path: str, key: str):
-    """启动后台转码线程：整文件转成 H.264/AAC 的 faststart mp4 缓存。"""
-    print("  [tc] 作业启动，探测中...", flush=True)
+def transcode_cmd(fs_path: str, mode: str, t_start: float) -> list:
+    """实时推流命令：转码输出分片 mp4（empty_moov）到 stdout，浏览器边收边播。"""
     ff = get_ffmpeg()
-    dur = probe_file(fs_path).get("dur") or 0
-    print("  [tc] 探测完成", flush=True)
-    os.makedirs(TRANSCACHE_DIR, exist_ok=True)
-    cache_mp4 = os.path.join(TRANSCACHE_DIR, key + ".mp4")
-    tmp = cache_mp4 + ".part"
-    enc_name, venc_args, enc_label = pick_video_encoder()
-    print(f"  [tc] 编码器: {enc_label}", flush=True)
-
-    cmd = [ff, "-y", "-hide_banner", "-loglevel", "info", "-i", fs_path]
-    if enc_name != "libx264":
-        cmd += ["-vf", "scale='min(1920,iw)':-2"]   # GPU 编码也限制到 1080p，保证速度
-    cmd += venc_args + ["-c:a", "aac", "-b:a", "192k", "-ac", "2",
-                        "-movflags", "+faststart", "-f", "mp4", tmp]
-    print("  [tc] ffmpeg 已启动", flush=True)
-
-    def worker():
-        print("  [tc] worker 线程开始", flush=True)
-        with _JOBS_LOCK:
-            job = _JOBS.setdefault(key, {"progress": 0, "done": False, "err": None})
-        print("  [tc] Popen 启动 ffmpeg...", flush=True)
-        try:
-            proc = subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
-            print(f"  [tc] ffmpeg pid={proc.pid} poll={proc.poll()}", flush=True)
-            for raw in iter(proc.stderr.readline, b""):
-                line = raw.decode("utf-8", "replace")
-                m = re.search(r"time=\s*(\d+):(\d+):(\d+\.?\d*)", line)
-                if m and dur:
-                    t = int(m.group(1)) * 3600 + int(m.group(2)) * 60 + float(m.group(3))
-                    with _JOBS_LOCK:
-                        job["progress"] = min(99, int(t / dur * 100)) if dur else job["progress"]
-            rc = proc.wait(timeout=3600)
-            if rc == 0 and os.path.isfile(tmp) and os.path.getsize(tmp) > 0:
-                os.replace(tmp, cache_mp4)
-                with _JOBS_LOCK:
-                    job["done"] = True
-                    job["progress"] = 100
-            else:
-                with _JOBS_LOCK:
-                    job["err"] = f"ffmpeg 退出码 {rc}"
-                try:
-                    os.remove(tmp)
-                except OSError:
-                    pass
-        except Exception as e:
-            with _JOBS_LOCK:
-                job["err"] = str(e)[:120]
-            try:
-                os.remove(tmp)
-            except Exception:
-                pass
-
-    threading.Thread(target=worker, daemon=True).start()
-    print("  [tc] worker 线程已 start", flush=True)
+    enc_name, venc_args, _ = pick_video_encoder()
+    cmd = [ff, "-hide_banner", "-loglevel", "error", "-nostdin"]
+    if t_start > 0.5:
+        cmd += ["-ss", f"{t_start:.3f}"]
+    cmd += ["-i", fs_path, "-map", "0:v:0", "-map", "0:a:0?"]
+    if mode == "transcode":
+        if enc_name != "libx264":
+            cmd += ["-vf", "scale='min(1920,iw)':-2"]   # 限制 1080p，保证转码快于播放
+        cmd += venc_args
+        # 2 秒一个关键帧，分片小、出画快（GPU/CPU 编码都适用）
+        cmd += ["-force_key_frames", "expr:gte(t,n_forced*2)"]
+    elif mode == "transcode_audio":
+        cmd += ["-c:v", "copy"]                # 视频浏览器能解，只补转音频
+    else:                                      # remux：编码全兼容，只换容器
+        cmd += ["-c:v", "copy", "-c:a", "copy"]
+    if mode != "remux":
+        cmd += ["-c:a", "aac", "-b:a", "160k", "-ac", "2"]
+    cmd += ["-avoid_negative_ts", "make_zero",
+            "-movflags", "+empty_moov+default_base_moof+frag_keyframe",
+            "-frag_duration", "2000000",
+            "-f", "mp4", "pipe:1"]
+    return cmd
 
 
-def transcode_status(fs_path: str, key: str) -> dict:
-    """返回 {done, progress, err}；没有任务时自动启动一个。"""
-    cache_mp4 = os.path.join(TRANSCACHE_DIR, key + ".mp4")
-    if os.path.isfile(cache_mp4) and os.path.getsize(cache_mp4) > 0:
-        return {"done": True, "progress": 100, "err": None}
-    with _JOBS_LOCK:
-        job = _JOBS.get(key)
-        if job is not None and not job["err"]:
-            return {"done": job["done"], "progress": job["progress"], "err": job["err"]}
-    start_transcode_job(fs_path, key)
-    return {"done": False, "progress": 0, "err": None}
-
-
-_TRANSCODE_SEM = threading.Semaphore(2)   # 最多同时 2 路转码
-_JOBS = {}                                # 缓存键 -> {"progress","done","err"}
-_JOBS_LOCK = threading.Lock()
+_TRANSCODE_SEM = threading.Semaphore(2)   # 最多同时 2 路实时转码
 
 
 def is_removable_drive(fs_path: str) -> bool:
@@ -1090,6 +1043,19 @@ main{position:relative;z-index:1;max-width:1200px;margin:0 auto;padding:20px 18p
   background:var(--back-bg);color:var(--back-text);font-size:17px;cursor:pointer;
   backdrop-filter:blur(10px);-webkit-backdrop-filter:blur(10px)}
 #back:hover{background:rgba(10,12,16,.75)}
+#tbar{position:absolute;left:0;right:0;bottom:0;z-index:5;display:none;align-items:center;gap:10px;
+  padding:14px 12px 8px;background:linear-gradient(transparent,rgba(0,0,0,.72))}
+#tbar.on{display:flex}
+#tbar button{background:none;border:none;color:#fff;font-size:16px;line-height:1;
+  padding:6px 4px;cursor:pointer;opacity:.92}
+#tbar button:active{transform:scale(.94)}
+#tprog{position:relative;flex:1;height:18px;display:flex;align-items:center;cursor:pointer;touch-action:none}
+#tprog::before{content:"";position:absolute;left:0;right:0;height:4px;border-radius:2px;
+  background:rgba(255,255,255,.26)}
+#tbuf,#tfill{position:absolute;left:0;height:4px;border-radius:2px;pointer-events:none}
+#tbuf{background:rgba(255,255,255,.42);width:0}
+#tfill{background:var(--grad);width:0}
+#ttime{color:#fff;font-size:11.5px;opacity:.92;white-space:nowrap;font-variant-numeric:tabular-nums}
 .pbody{max-width:900px;margin:0 auto;padding:18px 18px 44px;width:100%}
 .pfolder{font-size:12.5px;color:var(--dim);margin-bottom:8px}
 .pfolder a{color:var(--acc);text-decoration:none}
@@ -1201,6 +1167,12 @@ main{position:relative;z-index:1;max-width:1200px;margin:0 auto;padding:20px 18p
       <canvas id="vblur" width="160" height="90"></canvas>
       <button id="back" title="返回">←</button>
       <video id="v" controls playsinline webkit-playsinline preload="auto"></video>
+      <div id="tbar">
+        <button id="tplay" type="button"></button>
+        <div id="tprog"><div id="tbuf"></div><div id="tfill"></div></div>
+        <span id="ttime"></span>
+        <button id="tfs" type="button">⛶</button>
+      </div>
     </div>
     <div class="pbody">
       <div class="pfolder" id="pfolder"></div>
@@ -1251,7 +1223,13 @@ let curDir = "";
 let searchTimer = null;
 const itemsCache = {};
 let curItem = null, lastSaveAt = 0;
-let curTranscoding = false;   // 当前播放的是转码流（用于 seek 等行为区分）
+let streamMode = "direct";   // direct=原生文件（Range 拖动）/ trans=实时转码流
+let transStart = 0;          // 转码流 0 点对应的视频时间（seek 重启时更新）
+let effDur = 0;              // 服务端探测到的总时长（转码流的 duration 是 Infinity）
+let restarting = false;      // 换源重启中，忽略期间触发的 seeking
+let lastPlayAbs = 0;         // 最近一次的绝对播放位置（判断是小拖动还是大跳转）
+let pendingSeek = -1;        // 即将发起的绝对目标位置（seeking 事件里浏览器可能把 currentTime 截断）
+let tbarTimer = null, tbarDrag = false, tbarFrac = 0;
 
 /* ---------------- 工具 ---------------- */
 const ICON_CLAP = '<svg viewBox="0 0 24 24" style="width:14px;height:14px;vertical-align:-2px" fill="currentColor" aria-hidden="true"><path d="M18 4l2 4h-3l-2-4h-2l2 4h-3l-2-4H8l2 4H7L5 4H4c-1.1 0-2 .9-2 2v12c0 1.1.9 2 2 2h16c1.1 0 2-.9 2-2V4h-4z"/></svg>';
@@ -1851,11 +1829,38 @@ function drawVblur(force){
   }catch(e){}
 }
 
-function saveCurProgress(){
+function vTime(){
   const v = $("#v");
-  if(curItem && v.duration && v.currentTime > 5 && v.currentTime < v.duration*0.95){
+  return streamMode === "trans" ? transStart + (v.currentTime || 0) : v.currentTime;
+}
+function vDur(){
+  if(streamMode !== "trans"){
+    const d = $("#v").duration;
+    return isFinite(d) ? d : 0;
+  }
+  return effDur || 0;
+}
+function seekTrans(absT){
+  if(streamMode !== "trans" || !curItem) return;
+  if(effDur > 0) absT = Math.min(absT, effDur - 0.5);
+  absT = Math.max(0, absT);
+  if(Math.abs(absT - lastPlayAbs) <= 3){
+    $("#v").currentTime = absT - transStart;   // 小幅拖动：缓冲里直接跳
+    return;
+  }
+  // 大跳转：不经过浏览器 seek（分片流没有随机访问点，会被截断再扫描），
+  // 直接从新时间点重启转码，1~2 秒落位
+  restarting = true;
+  lastPlayAbs = absT;
+  transStart = absT;
+  $("#v").src = "/video?path=" + encodeURIComponent(curItem.path) + "&t=" + Math.round(absT);
+}
+
+function saveCurProgress(){
+  const t = vTime(), d = vDur();
+  if(curItem && d && t > 5 && t < d*0.95){
     const p = getProgress();
-    p[curItem.path] = {t: v.currentTime, d: v.duration};
+    p[curItem.path] = {t, d};
     setProgress(p);
   }
 }
@@ -1866,6 +1871,9 @@ function openPlayerByPath(path){
   curItem = item;
   const v = $("#v");
   lastSaveAt = 0;
+  streamMode = "direct"; transStart = 0; effDur = 0; restarting = false; tbarDrag = false;
+  stopTbar();
+  v.controls = true;
   const folder = item.folder !== undefined ? item.folder
                  : path.split("/").slice(0, -1).join("/");
 
@@ -1895,25 +1903,49 @@ function openPlayerByPath(path){
   setVwrapCollapsed(false);
   $("#pscroll").scrollTop = 0;
 
+  v.onerror = ()=>{
+    if(curItem && $("#player").classList.contains("on")) toast("视频加载失败，文件可能已损坏");
+  };
   v.onloadedmetadata = ()=>{
+    if(streamMode === "trans"){
+      if(transStart > 5 && !restarting) toast("已从 " + fmtTime(transStart) + " 继续播放");
+      restarting = false;
+      pendingSeek = -1;
+      lastPlayAbs = transStart;
+      v.play().catch(()=>{});   // 手机浏览器可能要求手动再点一下播放
+      return;
+    }
     const p = getProgress()[path];
     if(p && p.t > 5 && (!v.duration || p.t < v.duration*0.95)){
       v.currentTime = p.t;
       toast("已从 " + fmtTime(p.t) + " 继续播放");
     }
-    v.play().catch(()=>{});   // 手机浏览器可能要求手动再点一下播放
+    v.play().catch(()=>{});
   };
   v.onloadeddata = ()=> drawVblur(true);   // 首帧就绪后画一次静态模糊背景，播放中保持不变
   const saveNow = ()=>{
-    if(!curItem || !v.duration || v.ended) return;
+    const t = vTime(), d = vDur();
+    if(!curItem || !d || v.ended) return;
     lastSaveAt = Date.now();
     const p = getProgress();
-    p[curItem.path] = {t: v.currentTime, d: v.duration};
+    p[curItem.path] = {t, d};
     setProgress(p);
   };
   v.ontimeupdate = ()=>{
     // 播放中每 5 秒保存一次（timeupdate 约 250ms 一次，不能每次都写）
-    if(v.duration && curItem && Date.now() - lastSaveAt >= 5000) saveNow();
+    if(vDur() && curItem && Date.now() - lastSaveAt >= 5000) saveNow();
+    lastPlayAbs = transStart + v.currentTime;
+  };
+  v.onseeking = ()=>{
+    // 兜底：进度条以外发起的 seek（如「从头播放」按钮）也走重启转码
+    if(streamMode !== "trans" || restarting || !curItem) return;
+    const absT = pendingSeek >= 0 ? pendingSeek : transStart + Math.max(0, v.currentTime);
+    pendingSeek = -1;
+    if(Math.abs(absT - lastPlayAbs) <= 3) return;
+    restarting = true;
+    lastPlayAbs = absT;
+    transStart = absT;
+    v.src = "/video?path=" + encodeURIComponent(curItem.path) + "&t=" + Math.round(absT);
   };
   v.onplay = ()=>{
     thumbPaused = true;          // 播放优先：缩略图生成让出磁盘带宽
@@ -1934,40 +1966,22 @@ function openPlayerByPath(path){
     pumpThumbs();
     const p = getProgress(); delete p[curItem.path]; setProgress(p);
   };
-  // 先问服务器该文件能否直接播放：不能则后台转码（显示进度），完成后播放缓存文件
-  let transTagEl = null;
+  // 问服务器播放方式：direct=原生直读；cached=已有转码缓存当普通文件播；否则实时转码直推
   fetch("/api/info?path=" + encodeURIComponent(path)).then(r=>r.json()).then(d=>{
     if(!d.ok){ v.src = "/video?path=" + encodeURIComponent(path); return; }
     if(d.v && d.v !== "?") addTag("编码 " + d.v.toUpperCase());
-    if(d.dur) addTag("时长 " + fmtTime(d.dur));
-    if(d.mode === "direct"){
-      curTranscoding = false;
+    if(d.dur){ addTag("时长 " + fmtTime(d.dur)); effDur = d.dur; }
+    if(d.mode === "direct" || d.cached){
       v.src = "/video?path=" + encodeURIComponent(path);
       return;
     }
-    curTranscoding = true;
-    if(d.encoder) addTag("⚡ " + d.encoder, true);
-    transTagEl = addTag("⏳ 转码准备中…", true);
-    const poll = async ()=>{
-      while(curItem && curItem.path === path && curTranscoding){
-        try{
-          const r2 = await fetch("/api/transcode-status?path=" + encodeURIComponent(path));
-          const s2 = await r2.json();
-          if(s2.err){ toast("转码失败：" + s2.err); curTranscoding = false; break; }
-          if(transTagEl) transTagEl.textContent = "⚙ 转码中 " + s2.progress + "%";
-          if(s2.done){
-            curTranscoding = false;
-            if(transTagEl) transTagEl.textContent = "✓ 转码完成";
-            if(curItem && curItem.path === path){
-              v.src = "/video?path=" + encodeURIComponent(path);   // 缓存文件：进度条/拖动全正常
-            }
-            return;
-          }
-        }catch(e){ break; }
-        await new Promise(r2=>setTimeout(r2, 1200));
-      }
-    };
-    poll();
+    streamMode = "trans";
+    const p0t = (getProgress()[path] || {}).t || 0;
+    transStart = p0t > 5 ? p0t : 0;
+    if(d.encoder) addTag("⚡ 实时转码 · " + d.encoder, true);
+    v.controls = false;              // 转码流拖动靠重启转码实现，系统进度条不适用 → 自绘进度条
+    startTbar();
+    v.src = "/video?path=" + encodeURIComponent(path) + "&t=" + Math.round(transStart);
   }).catch(()=>{
     v.src = "/video?path=" + encodeURIComponent(path);
   });
@@ -1990,6 +2004,65 @@ async function loadMore(path, folder){
     others.forEach(x=> more.appendChild(videoCard(x)));
   }catch(e){ /* 忽略，更多列表只是锦上添花 */ }
 }
+
+/* ---------------- 转码流的进度条（流式 duration 是 Infinity，系统进度条不可用） ---------------- */
+function startTbar(){
+  stopTbar();
+  $("#tbar").classList.add("on");
+  tbarTimer = setInterval(updateTbar, 250);
+  updateTbar();
+}
+function stopTbar(){
+  if(tbarTimer){ clearInterval(tbarTimer); tbarTimer = null; }
+  $("#tbar").classList.remove("on");
+}
+function updateTbar(){
+  if(streamMode !== "trans" || !curItem) return;
+  const v = $("#v"), d = vDur(), t = vTime();
+  $("#tplay").textContent = v.paused ? "▶" : "❚❚";
+  $("#ttime").textContent = fmtTime(t) + " / " + (d ? fmtTime(d) : "--:--");
+  if(!tbarDrag && d) $("#tfill").style.width = Math.min(100, t/d*100) + "%";
+  let bufEnd = 0;
+  for(let i = 0; i < v.buffered.length; i++) bufEnd = Math.max(bufEnd, transStart + v.buffered.end(i));
+  $("#tbuf").style.width = d ? Math.min(100, bufEnd/d*100) + "%" : "0%";
+}
+(function(){
+  const tprog = $("#tprog");
+  const tfrac = e=>{
+    const r = tprog.getBoundingClientRect();
+    return Math.min(1, Math.max(0, (e.clientX - r.left) / r.width));
+  };
+  const paintDrag = ()=>{
+    $("#tfill").style.width = tbarFrac*100 + "%";
+    const d = vDur();
+    $("#ttime").textContent = fmtTime(tbarFrac*d) + " / " + (d ? fmtTime(d) : "--:--");
+  };
+  tprog.addEventListener("pointerdown", e=>{
+    if(streamMode !== "trans" || !vDur()) return;
+    tbarDrag = true; tbarFrac = tfrac(e);
+    try{ tprog.setPointerCapture(e.pointerId); }catch(err){}
+    paintDrag();
+    e.preventDefault();
+  });
+  tprog.addEventListener("pointermove", e=>{ if(tbarDrag){ tbarFrac = tfrac(e); paintDrag(); } });
+  tprog.addEventListener("pointerup", ()=>{ if(tbarDrag){ tbarDrag = false; seekTrans(tbarFrac * vDur()); } });
+  tprog.addEventListener("pointercancel", ()=>{ tbarDrag = false; });
+})();
+$("#tplay").addEventListener("click", ()=>{
+  const v = $("#v");
+  if(v.paused) v.play().catch(()=>{}); else v.pause();
+});
+$("#tfs").addEventListener("click", ()=>{
+  const v = $("#v");
+  if(document.fullscreenElement){ document.exitFullscreen(); return; }
+  const fn = v.requestFullscreen || v.webkitRequestFullscreen;
+  if(fn) fn.call(v);
+});
+$("#v").addEventListener("click", ()=>{
+  if(streamMode !== "trans") return;   // 原生播放用系统控件；转码流点画面=暂停/播放
+  const v = $("#v");
+  if(v.paused) v.play().catch(()=>{}); else v.pause();
+});
 
 /* ---------------- 暂停浏览：向下滚动时平滑收起视频区，方便逛宫格 ---------------- */
 let vwrapCollapsed = false;
@@ -2062,12 +2135,19 @@ $("#renameBtn").addEventListener("click", ()=>{
 
       // 无缝切到新路径，保持当前播放位置
       const v = $("#v");
-      const t = v.currentTime, wasPaused = v.paused;
-      v.onloadedmetadata = ()=>{
-        if(isFinite(t) && t > 0.1 && v.duration) v.currentTime = Math.min(t, v.duration - 0.2);
-        if(!wasPaused) v.play().catch(()=>{});
-      };
-      v.src = "/video?path=" + encodeURIComponent(d.new_path);
+      const t = vTime(), wasPaused = v.paused;
+      if(streamMode === "trans"){
+        restarting = true;
+        transStart = t;
+        v.onloadedmetadata = ()=>{ restarting = false; if(!wasPaused) v.play().catch(()=>{}); };
+        v.src = "/video?path=" + encodeURIComponent(d.new_path) + "&t=" + Math.round(t);
+      }else{
+        v.onloadedmetadata = ()=>{
+          if(isFinite(t) && t > 0.1 && v.duration) v.currentTime = Math.min(t, v.duration - 0.2);
+          if(!wasPaused) v.play().catch(()=>{});
+        };
+        v.src = "/video?path=" + encodeURIComponent(d.new_path);
+      }
       history.replaceState(null, "", "#/p/" + encodeURIComponent(d.new_path));
       toast("已重命名");
       loadMore(d.new_path, d.new_path.split("/").slice(0, -1).join("/"));
@@ -2156,10 +2236,13 @@ function stopPlayback(){
   saveCurProgress();
   const v = $("#v");
   v.pause();
+  stopTbar();
+  streamMode = "direct"; transStart = 0; effDur = 0; restarting = false; tbarDrag = false;
+  v.controls = true;
   thumbPaused = false;
   pumpThumbs();
   v.onloadedmetadata = v.ontimeupdate = v.onended = null;
-  v.onplay = v.onpause = v.onseeked = null;
+  v.onplay = v.onpause = v.onseeked = v.onseeking = v.onerror = null;
   v.removeAttribute("src"); v.load();
   vblur.style.display = "none";
   $("#player").classList.remove("on", "playing");
@@ -2178,6 +2261,7 @@ $("#restart").addEventListener("click", ()=>{
   if(!curItem) return;
   const p = getProgress(); delete p[curItem.path]; setProgress(p);
   const v = $("#v");
+  if(streamMode === "trans") pendingSeek = 0;   // 「从头播放」在转码流里=重启到 0 秒
   v.currentTime = 0; v.play().catch(()=>{});
   $("#restart").style.display = "none";
   toast("从头开始播放");
@@ -2337,24 +2421,13 @@ class Handler(BaseHTTPRequestHandler):
                 probe = probe_file(fs_path)
                 mode = play_mode(fs_path, ext, probe)
                 enc = pick_video_encoder()[2] if mode != "direct" else ""
-                st = {"done": True, "progress": 100, "err": None}
+                cached = False
                 if mode != "direct":
-                    os.makedirs(TRANSCACHE_DIR, exist_ok=True)
-                    st = transcode_status(fs_path, thumb_key(fs_path))
+                    key = thumb_key(fs_path)
+                    cached = os.path.isfile(os.path.join(TRANSCACHE_DIR, key + ".mp4"))
                 return self._json({"ok": True, "v": probe.get("v"), "a": probe.get("a"),
                                    "mode": mode, "encoder": enc, "dur": probe.get("dur") or 0,
-                                   "trans": st})
-            elif route == "/api/debug-jobs":
-                with _JOBS_LOCK:
-                    jobs = {k[:20]: dict(v) for k, v in _JOBS.items()}
-                return self._json({"jobs": jobs, "count": len(jobs)})
-            elif route == "/api/transcode-status":
-                fs_path = resolve(self._params().get("path", ""))
-                if fs_path is None or not os.path.isfile(fs_path):
-                    return self._json({"ok": False, "error": "文件不存在"})
-                os.makedirs(TRANSCACHE_DIR, exist_ok=True)
-                st = transcode_status(fs_path, thumb_key(fs_path))
-                return self._json({"ok": True, **st})
+                                   "cached": cached})
             elif route == "/video":
                 self.stream_video()
             elif route == "/thumb":
@@ -2530,7 +2603,7 @@ class Handler(BaseHTTPRequestHandler):
             return self._error(500, f"save failed: {e}")
         self._json({"ok": True})
 
-    # ---------- 视频流：能直接播的直读（支持 Range），不能的实时转码 ----------
+    # ---------- 视频流：能直接播的直读（支持 Range），不能的实时转码直推 ----------
     def stream_video(self):
         params = self._params()
         fs_path = resolve(params.get("path", ""))
@@ -2540,22 +2613,23 @@ class Handler(BaseHTTPRequestHandler):
 
         probe = probe_file(fs_path)
         mode = play_mode(fs_path, ext, probe)
+        t_start = 0.0
+        try:
+            t_start = max(0.0, float(params.get("t") or 0))
+        except ValueError:
+            pass
 
-        # ① 不能直接播的格式：后台转码到磁盘缓存，完成后按普通文件服务
-        #   （进度条/拖动/进度记忆与原生格式完全一致）
+        # ① 浏览器播不了的格式：已有完整转码缓存就当普通文件播，否则实时转码直推
         if mode != "direct":
             if not get_ffmpeg():
                 return self._error(501, "未检测到 ffmpeg，无法播放此格式")
-            os.makedirs(TRANSCACHE_DIR, exist_ok=True)
             key = thumb_key(fs_path)
             cache_mp4 = os.path.join(TRANSCACHE_DIR, key + ".mp4")
-            if not os.path.isfile(cache_mp4):
-                st = transcode_status(fs_path, key)
-                if not st["done"]:
-                    return self._json({"transcoding": True, "progress": st["progress"],
-                                       "err": st["err"]}, code=503)
-            serve_path = cache_mp4          # 缓存文件是 faststart mp4
-            fss = None
+            if os.path.isfile(cache_mp4) and os.path.getsize(cache_mp4) > 0:
+                serve_path = cache_mp4      # 缓存文件是 faststart mp4
+                fss = None
+            else:
+                return self.push_transcode(fs_path, mode, t_start)
         else:
             # moov 在尾部的 mp4：用内存里的虚拟 faststart 视图，不写任何缓存文件
             serve_path = fs_path
@@ -2614,6 +2688,50 @@ class Handler(BaseHTTPRequestHandler):
             pass  # 客户端中断（拖进度条/关闭页面）
         except Exception:
             pass  # 响应头已发出（如读盘被安全扫描阻塞后失败），只能断开连接
+
+    def push_transcode(self, fs_path: str, mode: str, t_start: float):
+        """实时转码直推：ffmpeg 分片 mp4 写 stdout，这里读一块发一块。
+        客户端断开（拖进度条/关页面）会触发写失败，随即杀掉 ffmpeg 释放编码器。"""
+        if self.command == "HEAD":
+            self.send_response(200)
+            self.send_header("Content-Type", "video/mp4")
+            self.send_header("Connection", "close")
+            self.end_headers()
+            return
+        if not _TRANSCODE_SEM.acquire(timeout=30):
+            return self._error(503, "转码通道忙，请稍后再试")
+        proc = None
+        try:
+            proc = subprocess.Popen(transcode_cmd(fs_path, mode, t_start),
+                                    stdout=subprocess.PIPE, stdin=subprocess.DEVNULL,
+                                    stderr=subprocess.DEVNULL, bufsize=0)
+            self.send_response(200)
+            self.send_header("Content-Type", "video/mp4")
+            self.send_header("Cache-Control", "no-store")
+            self.send_header("Connection", "close")   # 无 Content-Length，靠断开收尾
+            self.end_headers()
+            while True:
+                chunk = proc.stdout.read(65536)
+                if not chunk:
+                    break
+                self.wfile.write(chunk)
+            self.close_connection = True
+        except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError):
+            pass
+        except Exception:
+            pass
+        finally:
+            if proc is not None:
+                try:
+                    proc.kill()
+                    proc.wait(timeout=5)
+                except Exception:
+                    pass
+                try:
+                    proc.stdout.close()
+                except Exception:
+                    pass
+            _TRANSCODE_SEM.release()
 
 
 class VideoServer(ThreadingHTTPServer):
