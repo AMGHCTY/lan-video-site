@@ -1120,7 +1120,9 @@ main{position:relative;z-index:1;max-width:1200px;margin:0 auto;padding:20px 18p
 #renameBtn:active,#favBtn:active,#dlBtn:active{transform:scale(.97)}
 .pact{display:flex;gap:9px;margin:4px 0 6px;flex-wrap:wrap}
 @media (max-width:500px){
-  .pact button{flex:1 1 0;min-width:0;padding:10px 4px;font-size:13px;white-space:nowrap}
+  .pact{gap:8px}
+  .pact button{flex:1 1 0;min-width:0;padding:10px 2px;font-size:12.5px;white-space:nowrap}
+  .pact #restart{flex-grow:1.18}   /* 标签最长的按钮多分一点宽度，避免文字溢出 */
 }
 .moreh{margin:26px 0 12px;font-size:14px;font-weight:600;color:var(--text)}
 .moreh span{color:var(--dim);font-weight:400;font-size:12.5px}
@@ -1230,10 +1232,10 @@ main{position:relative;z-index:1;max-width:1200px;margin:0 auto;padding:20px 18p
       <div class="ptitle" id="ptitle"></div>
       <div class="chips2" id="pchips"></div>
       <div class="pact">
-        <button id="restart">↻&nbsp; 从头播放</button>
+        <button id="restart">↻ 从头播放</button>
         <button id="renameBtn">重命名</button>
-        <button id="favBtn">☆&nbsp; 收藏</button>
-        <button id="dlBtn">⬇&nbsp; 下载</button>
+        <button id="favBtn">☆ 收藏</button>
+        <button id="dlBtn">⬇ 下载</button>
       </div>
       <div class="moreh" id="moreh" style="display:none"></div>
       <div class="grid" id="more" style="display:none"></div>
