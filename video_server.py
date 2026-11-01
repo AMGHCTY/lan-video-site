@@ -25,7 +25,9 @@ import hashlib
 import json
 import os
 import re
+import shutil
 import socket
+import subprocess
 import sys
 import threading
 import time
@@ -49,6 +51,13 @@ SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 CONFIG_FILE = os.path.join(SCRIPT_DIR, "library.json")
 THUMB_DIR = os.path.join(SCRIPT_DIR, ".thumbcache")   # 缩略图磁盘缓存
 FAV_FILE = os.path.join(SCRIPT_DIR, "favorites.json")  # 收藏夹数据
+TRANSCACHE_DIR = os.path.join(SCRIPT_DIR, ".transcache")   # 转码缓存
+WARM_FILE = os.path.join(SCRIPT_DIR, ".warmcache.json")   # 已预热文件的状态记录
+
+# 浏览器可直接解码的范围
+BROWSER_VIDEO = {"h264", "vp9", "av01", "hevc"}   # hevc 依赖客户端硬解，默认直读
+BROWSER_AUDIO = {"aac", "mp3", "opus", "vorbis", "flac"}
+BROWSER_CONTAINER = {".mp4", ".m4v", ".mov", ".webm"}
 
 
 # ================================================================ 视频库（多目录）
@@ -187,6 +196,207 @@ def thumb_key(fs_path: str) -> str:
 
 def is_video(name: str) -> bool:
     return os.path.splitext(name)[1].lower() in VIDEO_EXTS
+
+
+# ================================================================ ffmpeg：格式探测与实时转码
+
+_FFMPEG = {"exe": None, "checked": False}
+_ENC_LOCK = threading.Lock()
+_ENC_CHOSEN = None        # (名称, 视频编码参数列表, 显示名)
+_PROBE_CACHE = {}         # (路径, mtime, size) -> {"v": 编码, "a": 编码}
+
+
+def get_ffmpeg() -> str | None:
+    """定位 ffmpeg：脚本目录 → PATH → imageio_ffmpeg 包。找不到返回 None。"""
+    if _FFMPEG["checked"]:
+        return _FFMPEG["exe"]
+    exe = None
+    for cand in (os.path.join(SCRIPT_DIR, "ffmpeg.exe"),
+                 os.path.join(SCRIPT_DIR, "ffmpeg", "ffmpeg.exe")):
+        if os.path.isfile(cand):
+            exe = cand
+            break
+    if exe is None:
+        exe = shutil.which("ffmpeg")
+    if exe is None:
+        try:
+            import imageio_ffmpeg
+            exe = imageio_ffmpeg.get_ffmpeg_exe()
+        except Exception:
+            pass
+    _FFMPEG["exe"] = exe
+    _FFMPEG["checked"] = True
+    return exe
+
+
+def probe_file(fs_path: str) -> dict:
+    """用 ffmpeg -i 探测视频/音频编码与时长（结果按文件缓存）。"""
+    st = os.stat(fs_path)
+    key = (os.path.abspath(fs_path).lower(), int(st.st_mtime), st.st_size)
+    with _ENC_LOCK:
+        if key in _PROBE_CACHE:
+            return _PROBE_CACHE[key]
+    v, a, dur = "?", "?", 0
+    try:
+        r = subprocess.run([get_ffmpeg(), "-hide_banner", "-i", fs_path],
+                           capture_output=True, text=True, timeout=30,
+                           encoding="utf-8", errors="replace")
+        for line in r.stderr.splitlines():
+            if "Video:" in line and v == "?":
+                m = re.search(r"Video:\s*(\w+)", line)
+                if m: v = m.group(1)
+            elif "Audio:" in line and a == "?":
+                m = re.search(r"Audio:\s*(\w+)", line)
+                if m: a = m.group(1)
+            elif "Duration:" in line and dur == 0:
+                m = re.search(r"Duration:\s*(\d+):(\d+):(\d+\.?\d*)", line)
+                if m:
+                    dur = int(m.group(1)) * 3600 + int(m.group(2)) * 60 + float(m.group(3))
+    except Exception:
+        pass
+    with _ENC_LOCK:
+        _PROBE_CACHE[key] = {"v": v, "a": a, "dur": dur}
+        return _PROBE_CACHE[key]
+
+
+def gen_thumb_ffmpeg(fs_path: str, out_path: str) -> bool:
+    """用 ffmpeg 从视频里截一帧存为 JPEG（浏览器解不了的格式用）。"""
+    ff = get_ffmpeg()
+    if not ff:
+        return False
+    for ss in ("3", "0"):
+        try:
+            r = subprocess.run([ff, "-hide_banner", "-loglevel", "error", "-ss", ss,
+                                "-i", fs_path, "-frames:v", "1", "-q:v", "4", "-y", out_path],
+                               capture_output=True, timeout=90)
+            if r.returncode == 0 and os.path.isfile(out_path) and os.path.getsize(out_path) > 0:
+                return True
+        except Exception:
+            continue
+    return False
+
+
+def play_mode(fs_path: str, ext: str, probe: dict) -> str:
+    """direct=浏览器直接播 / remux=换容器 / transcode_audio=只转音频 / transcode=全转码"""
+    if not get_ffmpeg():
+        return "direct"   # 没有 ffmpeg 只能直读
+    v_ok = probe.get("v") in BROWSER_VIDEO
+    a_ok = probe.get("a") in BROWSER_AUDIO
+    c_ok = ext in BROWSER_CONTAINER
+    if v_ok and a_ok and c_ok:
+        return "direct"
+    if v_ok and a_ok:
+        return "remux"            # 编码没问题，只是容器不兼容（avi/ts/mkv）→ 原样换壳
+    if v_ok:
+        return "transcode_audio"  # 视频能播但音频不行（AC3/DTS 等）→ 只转音频
+    return "transcode"            # 视频编码不兼容（HEVC 老设备/WMV/MPEG4 等）→ 全转码
+
+
+def pick_video_encoder():
+    """优先 GPU 编码（NVENC/QSV/AMF），探测失败回退 CPU x264。"""
+    global _ENC_CHOSEN
+    with _ENC_LOCK:
+        if _ENC_CHOSEN is not None:
+            return _ENC_CHOSEN
+    gpu_tests = [
+        ("nvenc", ["-c:v", "h264_nvenc", "-preset", "p2", "-rc", "vbr", "-cq", "24"], "GPU (NVIDIA NVENC)"),
+        ("qsv", ["-c:v", "h264_qsv", "-global_quality", "24"], "GPU (Intel QSV)"),
+        ("amf", ["-c:v", "h264_amf", "-quality", "speed"], "GPU (AMD AMF)"),
+    ]
+    chosen = ("libx264", ["-c:v", "libx264", "-preset", "veryfast", "-crf", "23",
+                          "-vf", "scale='min(1920,iw)':-2"], "CPU (x264)")
+    ff = get_ffmpeg()
+    if ff:
+        for name, args, label in gpu_tests:
+            try:
+                test = [ff, "-hide_banner", "-f", "lavfi",
+                        "-i", "testsrc=duration=0.3:size=640x360:rate=30"] + args + ["-f", "null", "-"]
+                r = subprocess.run(test, capture_output=True, timeout=30)
+                if r.returncode == 0:
+                    chosen = (name, args, label)
+                    break
+            except Exception:
+                continue
+    with _ENC_LOCK:
+        _ENC_CHOSEN = chosen
+    return chosen
+
+
+def start_transcode_job(fs_path: str, key: str):
+    """启动后台转码线程：整文件转成 H.264/AAC 的 faststart mp4 缓存。"""
+    print("  [tc] 作业启动，探测中...", flush=True)
+    ff = get_ffmpeg()
+    dur = probe_file(fs_path).get("dur") or 0
+    print("  [tc] 探测完成", flush=True)
+    os.makedirs(TRANSCACHE_DIR, exist_ok=True)
+    cache_mp4 = os.path.join(TRANSCACHE_DIR, key + ".mp4")
+    tmp = cache_mp4 + ".part"
+    enc_name, venc_args, enc_label = pick_video_encoder()
+    print(f"  [tc] 编码器: {enc_label}", flush=True)
+
+    cmd = [ff, "-y", "-hide_banner", "-loglevel", "info", "-i", fs_path]
+    if enc_name != "libx264":
+        cmd += ["-vf", "scale='min(1920,iw)':-2"]   # GPU 编码也限制到 1080p，保证速度
+    cmd += venc_args + ["-c:a", "aac", "-b:a", "192k", "-ac", "2",
+                        "-movflags", "+faststart", "-f", "mp4", tmp]
+    print("  [tc] ffmpeg 已启动", flush=True)
+
+    def worker():
+        print("  [tc] worker 线程开始", flush=True)
+        with _JOBS_LOCK:
+            job = _JOBS.setdefault(key, {"progress": 0, "done": False, "err": None})
+        print("  [tc] Popen 启动 ffmpeg...", flush=True)
+        try:
+            proc = subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
+            print(f"  [tc] ffmpeg pid={proc.pid} poll={proc.poll()}", flush=True)
+            for raw in iter(proc.stderr.readline, b""):
+                line = raw.decode("utf-8", "replace")
+                m = re.search(r"time=\s*(\d+):(\d+):(\d+\.?\d*)", line)
+                if m and dur:
+                    t = int(m.group(1)) * 3600 + int(m.group(2)) * 60 + float(m.group(3))
+                    with _JOBS_LOCK:
+                        job["progress"] = min(99, int(t / dur * 100)) if dur else job["progress"]
+            rc = proc.wait(timeout=3600)
+            if rc == 0 and os.path.isfile(tmp) and os.path.getsize(tmp) > 0:
+                os.replace(tmp, cache_mp4)
+                with _JOBS_LOCK:
+                    job["done"] = True
+                    job["progress"] = 100
+            else:
+                with _JOBS_LOCK:
+                    job["err"] = f"ffmpeg 退出码 {rc}"
+                try:
+                    os.remove(tmp)
+                except OSError:
+                    pass
+        except Exception as e:
+            with _JOBS_LOCK:
+                job["err"] = str(e)[:120]
+            try:
+                os.remove(tmp)
+            except Exception:
+                pass
+
+    threading.Thread(target=worker, daemon=True).start()
+    print("  [tc] worker 线程已 start", flush=True)
+
+
+def transcode_status(fs_path: str, key: str) -> dict:
+    """返回 {done, progress, err}；没有任务时自动启动一个。"""
+    cache_mp4 = os.path.join(TRANSCACHE_DIR, key + ".mp4")
+    if os.path.isfile(cache_mp4) and os.path.getsize(cache_mp4) > 0:
+        return {"done": True, "progress": 100, "err": None}
+    with _JOBS_LOCK:
+        job = _JOBS.get(key)
+        if job is not None and not job["err"]:
+            return {"done": job["done"], "progress": job["progress"], "err": job["err"]}
+    start_transcode_job(fs_path, key)
+    return {"done": False, "progress": 0, "err": None}
+
+
+_TRANSCODE_SEM = threading.Semaphore(2)   # 最多同时 2 路转码
+_JOBS = {}                                # 缓存键 -> {"progress","done","err"}
+_JOBS_LOCK = threading.Lock()
 
 
 def is_removable_drive(fs_path: str) -> bool:
@@ -633,7 +843,6 @@ FAVS = FavStore()
 # 触发安全扫描 + 填满系统文件缓存，之后播放和缩略图都是秒开。
 
 _WARM_SEM = threading.Semaphore(1)
-WARM_FILE = os.path.join(SCRIPT_DIR, ".warmcache.json")   # 已预热文件的状态记录
 
 
 def warm_video_file(fs_path: str):
@@ -1042,6 +1251,7 @@ let curDir = "";
 let searchTimer = null;
 const itemsCache = {};
 let curItem = null, lastSaveAt = 0;
+let curTranscoding = false;   // 当前播放的是转码流（用于 seek 等行为区分）
 
 /* ---------------- 工具 ---------------- */
 const ICON_CLAP = '<svg viewBox="0 0 24 24" style="width:14px;height:14px;vertical-align:-2px" fill="currentColor" aria-hidden="true"><path d="M18 4l2 4h-3l-2-4h-2l2 4h-3l-2-4H8l2 4H7L5 4H4c-1.1 0-2 .9-2 2v12c0 1.1.9 2 2 2h16c1.1 0 2-.9 2-2V4h-4z"/></svg>';
@@ -1724,7 +1934,43 @@ function openPlayerByPath(path){
     pumpThumbs();
     const p = getProgress(); delete p[curItem.path]; setProgress(p);
   };
-  v.src = "/video?path=" + encodeURIComponent(path);
+  // 先问服务器该文件能否直接播放：不能则后台转码（显示进度），完成后播放缓存文件
+  let transTagEl = null;
+  fetch("/api/info?path=" + encodeURIComponent(path)).then(r=>r.json()).then(d=>{
+    if(!d.ok){ v.src = "/video?path=" + encodeURIComponent(path); return; }
+    if(d.v && d.v !== "?") addTag("编码 " + d.v.toUpperCase());
+    if(d.dur) addTag("时长 " + fmtTime(d.dur));
+    if(d.mode === "direct"){
+      curTranscoding = false;
+      v.src = "/video?path=" + encodeURIComponent(path);
+      return;
+    }
+    curTranscoding = true;
+    if(d.encoder) addTag("⚡ " + d.encoder, true);
+    transTagEl = addTag("⏳ 转码准备中…", true);
+    const poll = async ()=>{
+      while(curItem && curItem.path === path && curTranscoding){
+        try{
+          const r2 = await fetch("/api/transcode-status?path=" + encodeURIComponent(path));
+          const s2 = await r2.json();
+          if(s2.err){ toast("转码失败：" + s2.err); curTranscoding = false; break; }
+          if(transTagEl) transTagEl.textContent = "⚙ 转码中 " + s2.progress + "%";
+          if(s2.done){
+            curTranscoding = false;
+            if(transTagEl) transTagEl.textContent = "✓ 转码完成";
+            if(curItem && curItem.path === path){
+              v.src = "/video?path=" + encodeURIComponent(path);   // 缓存文件：进度条/拖动全正常
+            }
+            return;
+          }
+        }catch(e){ break; }
+        await new Promise(r2=>setTimeout(r2, 1200));
+      }
+    };
+    poll();
+  }).catch(()=>{
+    v.src = "/video?path=" + encodeURIComponent(path);
+  });
   loadMore(path, folder);
   refreshFavState();
 }
@@ -2083,6 +2329,32 @@ class Handler(BaseHTTPRequestHandler):
                     return self._json({"ok": True, "folders": folders, "fids": fids})
                 FAVS.validate()   # 清掉源文件已删除的收藏
                 return self._json({"ok": True, "folders": FAVS.folders_with_counts()})
+            elif route == "/api/info":
+                fs_path = resolve(self._params().get("path", ""))
+                if fs_path is None or not os.path.isfile(fs_path):
+                    return self._json({"ok": False, "error": "文件不存在"})
+                ext = os.path.splitext(fs_path)[1].lower()
+                probe = probe_file(fs_path)
+                mode = play_mode(fs_path, ext, probe)
+                enc = pick_video_encoder()[2] if mode != "direct" else ""
+                st = {"done": True, "progress": 100, "err": None}
+                if mode != "direct":
+                    os.makedirs(TRANSCACHE_DIR, exist_ok=True)
+                    st = transcode_status(fs_path, thumb_key(fs_path))
+                return self._json({"ok": True, "v": probe.get("v"), "a": probe.get("a"),
+                                   "mode": mode, "encoder": enc, "dur": probe.get("dur") or 0,
+                                   "trans": st})
+            elif route == "/api/debug-jobs":
+                with _JOBS_LOCK:
+                    jobs = {k[:20]: dict(v) for k, v in _JOBS.items()}
+                return self._json({"jobs": jobs, "count": len(jobs)})
+            elif route == "/api/transcode-status":
+                fs_path = resolve(self._params().get("path", ""))
+                if fs_path is None or not os.path.isfile(fs_path):
+                    return self._json({"ok": False, "error": "文件不存在"})
+                os.makedirs(TRANSCACHE_DIR, exist_ok=True)
+                st = transcode_status(fs_path, thumb_key(fs_path))
+                return self._json({"ok": True, **st})
             elif route == "/video":
                 self.stream_video()
             elif route == "/thumb":
@@ -2188,18 +2460,35 @@ class Handler(BaseHTTPRequestHandler):
         fs_path = resolve(self._params().get("path", ""))
         if fs_path is None or not os.path.isfile(fs_path):
             return self._error(404, "no thumb")
+        ext = os.path.splitext(fs_path)[1].lower()
+        key = thumb_key(fs_path)
+        jpg = os.path.join(THUMB_DIR, key + ".jpg")
         try:
-            key = thumb_key(fs_path)
-            with open(os.path.join(THUMB_DIR, key + ".jpg"), "rb") as f:
+            with open(jpg, "rb") as f:
                 data = f.read()
         except OSError:
-            return self._error(404, "no thumb")
+            # 缓存未命中：浏览器解不了的格式由 ffmpeg 服务端生成缩略图
+            ff = get_ffmpeg()
+            if ff and play_mode(fs_path, ext, probe_file(fs_path)) != "direct":
+                os.makedirs(THUMB_DIR, exist_ok=True)
+                if gen_thumb_ffmpeg(fs_path, jpg):
+                    with open(jpg, "rb") as f:
+                        data = f.read()
+                else:
+                    return self._error(404, "no thumb")
+            else:
+                return self._error(404, "no thumb")
         dur = ""
         try:
             with open(os.path.join(THUMB_DIR, key + ".json"), encoding="utf-8") as f:
                 dur = str(json.load(f).get("d") or "")
         except Exception:
             pass
+        if not dur:
+            try:
+                dur = str(probe_file(fs_path).get("dur") or "")
+            except Exception:
+                pass
         self.send_response(200)
         self.send_header("Content-Type", "image/jpeg")
         self.send_header("Content-Length", str(len(data)))
@@ -2241,17 +2530,38 @@ class Handler(BaseHTTPRequestHandler):
             return self._error(500, f"save failed: {e}")
         self._json({"ok": True})
 
-    # ---------- 视频流（支持 Range，手机端拖进度条必需） ----------
+    # ---------- 视频流：能直接播的直读（支持 Range），不能的实时转码 ----------
     def stream_video(self):
-        fs_path = resolve(self._params().get("path", ""))
+        params = self._params()
+        fs_path = resolve(params.get("path", ""))
         if fs_path is None or not os.path.isfile(fs_path):
             return self._error(404, "文件不存在")
         ext = os.path.splitext(fs_path)[1].lower()
 
-        # moov 在尾部的 mp4：用内存里的虚拟重排视图提供流，不写任何缓存文件
-        fss = get_faststart(fs_path) if ext in FASTSTART_EXTS else None
-        size = fss.size if fss is not None else os.path.getsize(fs_path)
-        ctype = VIDEO_EXTS.get(ext, "application/octet-stream")
+        probe = probe_file(fs_path)
+        mode = play_mode(fs_path, ext, probe)
+
+        # ① 不能直接播的格式：后台转码到磁盘缓存，完成后按普通文件服务
+        #   （进度条/拖动/进度记忆与原生格式完全一致）
+        if mode != "direct":
+            if not get_ffmpeg():
+                return self._error(501, "未检测到 ffmpeg，无法播放此格式")
+            os.makedirs(TRANSCACHE_DIR, exist_ok=True)
+            key = thumb_key(fs_path)
+            cache_mp4 = os.path.join(TRANSCACHE_DIR, key + ".mp4")
+            if not os.path.isfile(cache_mp4):
+                st = transcode_status(fs_path, key)
+                if not st["done"]:
+                    return self._json({"transcoding": True, "progress": st["progress"],
+                                       "err": st["err"]}, code=503)
+            serve_path = cache_mp4          # 缓存文件是 faststart mp4
+            fss = None
+        else:
+            # moov 在尾部的 mp4：用内存里的虚拟 faststart 视图，不写任何缓存文件
+            serve_path = fs_path
+            fss = get_faststart(fs_path) if ext in FASTSTART_EXTS else None
+        size = os.path.getsize(serve_path)
+        ctype = "video/mp4" if mode != "direct" else VIDEO_EXTS.get(ext, "application/octet-stream")
 
         start, end, status = 0, size - 1, 200
         range_header = self.headers.get("Range")
@@ -2291,7 +2601,7 @@ class Handler(BaseHTTPRequestHandler):
                     for piece in iter_faststart_data(fss, f, start, length):
                         self.wfile.write(piece)
             else:
-                with open(fs_path, "rb") as f:
+                with open(serve_path, "rb") as f:
                     f.seek(start)
                     remaining = length
                     while remaining > 0:
@@ -2447,6 +2757,10 @@ def main():
         print("  未检测到局域网 IP，请检查网络连接")
     print("  停止服务  按 Ctrl+C 或输入 q")
     print("  添加目录  在下方输入框粘贴文件夹路径回车（help 查看命令）")
+    if get_ffmpeg():
+        print("  格式兼容：ffmpeg 已就绪，不兼容格式自动实时转码（GPU 优先）")
+    else:
+        print("  格式兼容：未检测到 ffmpeg，仅支持浏览器原生格式")
     print("═" * 56)
     print(flush=True)
 
@@ -2456,6 +2770,7 @@ def main():
     threading.Thread(target=console_thread, args=(server,), daemon=True).start()
     if not ARGS.no_warmup:
         threading.Thread(target=warm_library, args=(LIB.roots(), "启动预热"), daemon=True).start()
+    threading.Thread(target=pick_video_encoder, daemon=True).start()
     try:
         server.serve_forever()
     except KeyboardInterrupt:
