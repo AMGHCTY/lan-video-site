@@ -88,7 +88,7 @@ python video_server.py
 | 包 | 大小 | 说明 |
 | --- | --- | --- |
 | `lan-video-site-portable-v1.0.3.zip` | ~11 MB | 仅内置 Python，只支持浏览器原生格式 |
-| `lan-video-site-portable-ffmpeg-v1.1.3.zip` | ~40 MB | 内置 Python + 完整 ffmpeg，**全格式实时转码（推荐）** |
+| `lan-video-site-portable-ffmpeg-v1.1.0.zip` | ~40 MB | 内置 Python + 完整 ffmpeg，**全格式实时转码（推荐）** |
 
 解压 → 双击「启动视频站.bat」。自搭环境时若想手动配 ffmpeg：把 `ffmpeg.exe` 放在
 `video_server.py` 旁边（或 `ffmpeg\ffmpeg.exe`），建议 Windows 64 位静态构建 7.x
