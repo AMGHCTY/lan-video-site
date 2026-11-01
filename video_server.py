@@ -1691,9 +1691,9 @@ function openPlayerByPath(path){
       v.currentTime = p.t;
       toast("已从 " + fmtTime(p.t) + " 继续播放");
     }
-    drawVblur(true);
     v.play().catch(()=>{});   // 手机浏览器可能要求手动再点一下播放
   };
+  v.onloadeddata = ()=> drawVblur(true);   // 首帧就绪后画一次静态模糊背景，播放中保持不变
   const saveNow = ()=>{
     if(!curItem || !v.duration || v.ended) return;
     lastSaveAt = Date.now();
@@ -1704,9 +1704,7 @@ function openPlayerByPath(path){
   v.ontimeupdate = ()=>{
     // 播放中每 5 秒保存一次（timeupdate 约 250ms 一次，不能每次都写）
     if(v.duration && curItem && Date.now() - lastSaveAt >= 5000) saveNow();
-    drawVblur();
   };
-  v.onseeked = ()=> drawVblur(true);
   v.onplay = ()=>{
     thumbPaused = true;          // 播放优先：缩略图生成让出磁盘带宽
     setVwrapCollapsed(false);
@@ -1715,7 +1713,6 @@ function openPlayerByPath(path){
   };
   v.onpause = ()=>{
     saveNow();
-    drawVblur(true);
     thumbPaused = false;
     pumpThumbs();
     $("#player").classList.remove("playing");   // 暂停后取消吸顶，下滑可收起视频区
