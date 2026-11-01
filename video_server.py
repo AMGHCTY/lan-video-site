@@ -20,6 +20,7 @@
 """
 
 import argparse
+import ctypes
 import hashlib
 import json
 import os
@@ -49,60 +50,6 @@ CONFIG_FILE = os.path.join(SCRIPT_DIR, "library.json")
 THUMB_DIR = os.path.join(SCRIPT_DIR, ".thumbcache")   # 缩略图磁盘缓存
 FAV_FILE = os.path.join(SCRIPT_DIR, "favorites.json")  # 收藏夹数据
 
-# 视频文件句柄池：复用已打开的句柄，减少慢速介质（U 盘）上反复 open 的开销
-_HANDLE_POOL = {}
-_HANDLE_ORDER = []
-_HANDLE_GUARD = threading.Lock()
-POOL_MAX = 6
-
-
-def get_video_handle(fs_path: str):
-    """返回 (文件对象, 该文件的锁)。同一文件的请求排队复用句柄，避免随机读写。"""
-    st = os.stat(fs_path)
-    key = (os.path.abspath(fs_path).lower(), st.st_size, int(st.st_mtime))
-    with _HANDLE_GUARD:
-        ent = _HANDLE_POOL.get(key)
-        if ent is not None:
-            _HANDLE_ORDER.remove(key)
-            _HANDLE_ORDER.append(key)
-            return ent[0], ent[1]
-    f = open(fs_path, "rb")
-    lk = threading.Lock()
-    with _HANDLE_GUARD:
-        if key not in _HANDLE_POOL:            # 双重检查：另一线程可能刚建过
-            _HANDLE_POOL[key] = [f, lk]
-            _HANDLE_ORDER.append(key)
-            while len(_HANDLE_ORDER) > POOL_MAX:
-                old = _HANDLE_ORDER.pop(0)
-                try:
-                    _HANDLE_POOL.pop(old)[0].close()
-                except Exception:
-                    pass
-            return f, lk
-    f.close()
-    ent = _HANDLE_POOL[key]
-    return ent[0], ent[1]
-
-
-def drop_video_handle(fs_path: str):
-    """读盘失败（文件变动/U 盘被拔出）时丢弃池中句柄，下次请求重新打开。"""
-    try:
-        st = os.stat(fs_path)
-        key = (os.path.abspath(fs_path).lower(), st.st_size, int(st.st_mtime))
-    except OSError:
-        return
-    with _HANDLE_GUARD:
-        ent = _HANDLE_POOL.pop(key, None)
-        if ent is not None:
-            try:
-                ent[0].close()
-            except Exception:
-                pass
-            try:
-                _HANDLE_ORDER.remove(key)
-            except ValueError:
-                pass
-
 
 # ================================================================ 视频库（多目录）
 
@@ -124,8 +71,8 @@ class Library:
                 with open(CONFIG_FILE, encoding="utf-8") as f:
                     data = json.load(f)
                 for d in data.get("dirs", []):
-                    if isinstance(d, dict) and isinstance(d.get("path"), str) \
-                            and os.path.isdir(d["path"]):
+                    # 目录暂时不可用（如 U 盘未插）也保留，重新挂载后自动恢复
+                    if isinstance(d, dict) and isinstance(d.get("path"), str):
                         loaded.append({
                             "alias": str(d.get("alias") or self._basename(d["path"])),
                             "path": os.path.abspath(d["path"]),
@@ -240,6 +187,15 @@ def thumb_key(fs_path: str) -> str:
 
 def is_video(name: str) -> bool:
     return os.path.splitext(name)[1].lower() in VIDEO_EXTS
+
+
+def is_removable_drive(fs_path: str) -> bool:
+    """Windows 可移动磁盘（U 盘）：每次重新插拔后文件的扫描缓存会失效。"""
+    try:
+        drive = os.path.splitdrive(os.path.abspath(fs_path))[0] + "\\"
+        return ctypes.windll.kernel32.GetDriveTypeW(drive) == 2   # DRIVE_REMOVABLE
+    except Exception:
+        return False
 
 
 _COUNT_CACHE = {}   # 目录 -> (时间, 视频数)，避免每次导航都遍历
@@ -636,6 +592,22 @@ class FavStore:
             self.save()
         return out
 
+    def validate(self):
+        """删除源文件已不存在的收藏条目。返回是否清理过。"""
+        with self.lock:
+            keep, dropped = [], False
+            for i in self.items:
+                fs = resolve(i["path"])
+                if fs is None or not os.path.isfile(fs):
+                    dropped = True
+                    continue
+                keep.append(i)
+            if dropped:
+                self.items = keep
+        if dropped:
+            self.save()
+        return dropped
+
     def fids_for(self, rel: str):
         with self.lock:
             return [i["fid"] for i in self.items if i["path"] == rel]
@@ -685,6 +657,7 @@ def warm_library(roots, label=""):
                 state = {}
         n, total, skipped, new_state = 0, 0, 0, {}
         for entry in roots:
+            removable = is_removable_drive(entry["path"])
             for dirpath, dirnames, filenames in os.walk(entry["path"]):
                 dirnames[:] = [d for d in dirnames if not d.startswith((".", "$"))]
                 for name in filenames:
@@ -698,11 +671,13 @@ def warm_library(roots, label=""):
                     key = p.lower()
                     sig = f"{int(st.st_mtime)}:{st.st_size}"
                     new_state[key] = sig
-                    if state.get(key) == sig:
+                    # 可移动磁盘每次重新挂载后扫描缓存失效，需要完整读取重新触发；
+                    # 固定磁盘的扫描结果会保留，读个开头维持缓存即可
+                    if state.get(key) == sig and not removable:
                         skipped += 1
-                        try:   # 轻触一下，维持扫描/缓存状态
+                        try:
                             with open(p, "rb") as f:
-                                f.read(65536)
+                                f.read(262144)
                         except OSError:
                             pass
                         continue
@@ -714,10 +689,35 @@ def warm_library(roots, label=""):
                 json.dump(new_state, f, ensure_ascii=False)
         except Exception:
             pass
+        prune_thumbcache()
         msg = f"{skipped} 个已缓存跳过"
         if n:
-            msg += f"，新/变更 {n} 个 / {total/1048576:.0f}MB 已预热"
+            msg += f"，完整预热 {n} 个 / {total/1048576:.0f}MB"
         print(f"  ♨ 预热完成（{label}）：{msg}", flush=True)
+
+
+def prune_thumbcache():
+    """清理缩略图缓存里源文件已不存在的孤儿条目。"""
+    if not os.path.isdir(THUMB_DIR):
+        return
+    removed = 0
+    for fn in os.listdir(THUMB_DIR):
+        if not fn.endswith(".json"):
+            continue
+        fp = os.path.join(THUMB_DIR, fn)
+        try:
+            with open(fp, encoding="utf-8") as f:
+                src = json.load(f).get("p", "")
+            if src and not os.path.isfile(src):
+                os.remove(fp)
+                jpg = fp[:-5] + ".jpg"
+                if os.path.exists(jpg):
+                    os.remove(jpg)
+                removed += 1
+        except Exception:
+            continue
+    if removed:
+        print(f"  ♨ 已清理 {removed} 个失效缩略图缓存", flush=True)
 
 
 # ================================================================ 页面
@@ -1123,6 +1123,8 @@ function pumpThumbs(){
   const box = thumbQueue.shift();
   makeThumb(box).finally(()=>{ thumbBusy = false; pumpThumbs(); });
 }
+// 看门狗：任何原因导致的队列停顿都会被自动拉起
+setInterval(()=>{ if(!thumbPaused) pumpThumbs(); }, 2500);
 
 function drawThumbFromURL(box, url, dur){
   const canvas = box.querySelector("canvas");
@@ -1199,7 +1201,7 @@ function makeThumb(box){
       v.removeAttribute("src"); v.load();
       resolve(ok);
     };
-    const timer = setTimeout(()=>done(false), 20000);
+    const timer = setTimeout(()=>done(false), 45000);   // 慢盘首次打开可能触发安全扫描，需要更久
     v.onerror = ()=>{ clearTimeout(timer); done(false); };
     v.onloadedmetadata = ()=>{
       const d = v.duration;
@@ -1450,6 +1452,7 @@ async function renderBrowse(data){
       ? "还没有视频目录<br>点上方 <b>＋ 添加视频目录</b>，或把视频放进服务目录下的「视频」文件夹"
       : "这个文件夹里没有视频";
   }
+  pumpThumbs();
 }
 
 function showSearch(list, q){
@@ -1465,6 +1468,7 @@ function showSearch(list, q){
     });
     grid.appendChild(videoCard(item));
   });
+  pumpThumbs();
 }
 
 let navSeq = 0;   // 渲染序号：慢的旧响应不覆盖新的（搜索/切换目录竞态保护）
@@ -1590,6 +1594,7 @@ async function openFavItems(fid){
   d.items.forEach(i=>{
     grid.appendChild(videoCard({path: i.path, name: i.name, size: i.size, mtime: i.mtime}));
   });
+  pumpThumbs();
   if(!d.items.length){
     box.className = "empty";
     box.innerHTML = "还没有收藏视频<br>打开一个视频，点 <b>⭐ 收藏</b> 添加到这里";
@@ -2079,7 +2084,19 @@ class Handler(BaseHTTPRequestHandler):
                     for d in folders:
                         d["has"] = d["id"] in fids
                     return self._json({"ok": True, "folders": folders, "fids": fids})
+                FAVS.validate()   # 清掉源文件已删除的收藏
                 return self._json({"ok": True, "folders": FAVS.folders_with_counts()})
+            elif route == "/dbg-open":
+                p = self._params().get("path", "")
+                fs = resolve(p)
+                t0 = time.perf_counter()
+                try:
+                    with open(fs, "rb") as f:
+                        n = len(f.read(262144))
+                    self._json({"ok": True, "ms": round((time.perf_counter()-t0)*1000), "n": n})
+                except Exception as e:
+                    self._json({"ok": False, "err": f"{type(e).__name__}: {e}",
+                                "ms": round((time.perf_counter()-t0)*1000)})
             elif route == "/video":
                 self.stream_video()
             elif route == "/thumb":
@@ -2230,8 +2247,8 @@ class Handler(BaseHTTPRequestHandler):
             os.replace(tmp, os.path.join(THUMB_DIR, key + ".jpg"))
             try:
                 d = float(params.get("d") or 0)
-                with open(os.path.join(THUMB_DIR, key + ".json"), "w") as f:
-                    json.dump({"d": d}, f)
+                with open(os.path.join(THUMB_DIR, key + ".json"), "w", encoding="utf-8") as f:
+                    json.dump({"d": d, "p": os.path.abspath(fs_path)}, f, ensure_ascii=False)
             except Exception:
                 pass
         except OSError as e:
@@ -2284,13 +2301,11 @@ class Handler(BaseHTTPRequestHandler):
 
         try:
             if fss is not None:
-                f, lk = get_video_handle(fs_path)
-                with lk:
+                with open(fs_path, "rb") as f:
                     for piece in iter_faststart_data(fss, f, start, length):
                         self.wfile.write(piece)
             else:
-                f, lk = get_video_handle(serve_path)
-                with lk:
+                with open(fs_path, "rb") as f:
                     f.seek(start)
                     remaining = length
                     while remaining > 0:
@@ -2301,8 +2316,9 @@ class Handler(BaseHTTPRequestHandler):
                         remaining -= len(chunk)
         except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError):
             pass  # 客户端中断（拖进度条/关闭页面）
-        except OSError:
-            drop_video_handle(fs_path)   # 读盘失败（文件变动/介质被拔出），弃用句柄
+        except Exception:
+            pass  # 响应头已发出（如读盘被安全扫描阻塞后失败），只能断开连接
+        print(f"[dbg] done T{threading.get_ident()} 实发={sent if 'sent' in dir() else '-'}", flush=True)
 
 
 class VideoServer(ThreadingHTTPServer):
