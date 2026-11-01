@@ -435,9 +435,12 @@ def list_dir(rel: str):
         return {"cur": "", "folders": folders, "videos": videos}
 
     fs_path = resolve(rel)
-    if fs_path is None or not os.path.isdir(fs_path):
-        return None
+    if fs_path is None:
+        return None                 # 库外路径：非法请求
     rel_norm = "/".join(p for p in rel.replace("\\", "/").split("/") if p and p != ".")
+    if not os.path.isdir(fs_path):
+        # 目录在库里但已不存在（被删除 / 移动硬盘未连接）：返回空页而非 404
+        return {"cur": rel_norm, "folders": [], "videos": [], "missing": True}
     try:
         names = os.listdir(fs_path)
     except OSError:
@@ -1664,6 +1667,12 @@ async function renderBrowse(data){
   const box = $("#emptybox"); box.innerHTML = "";
   grid.className = "grid";
   grid.style.gridTemplateColumns = isRoot ? "repeat(auto-fill,minmax(240px,1fr))" : "";
+
+  if(data.missing){   // 目录在库里但磁盘上已不存在（被删/设备未连接）
+    box.className = "empty";
+    box.innerHTML = "📁 目录不存在<br>可能已被删除，或移动硬盘 / U 盘未连接";
+    return;
+  }
 
   if(isRoot){   // 首页顶部：收藏夹区
     try{
