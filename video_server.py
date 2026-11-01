@@ -237,6 +237,7 @@ def probe_file(fs_path: str) -> dict:
         if key in _PROBE_CACHE:
             return _PROBE_CACHE[key]
     v, a, dur = "?", "?", 0
+    w = h = 0
     try:
         r = subprocess.run([get_ffmpeg(), "-hide_banner", "-i", fs_path],
                            capture_output=True, text=True, timeout=30,
@@ -245,6 +246,8 @@ def probe_file(fs_path: str) -> dict:
             if "Video:" in line and v == "?":
                 m = re.search(r"Video:\s*(\w+)", line)
                 if m: v = m.group(1)
+                r2 = re.search(r"[, ](\d{2,5})x(\d{2,5})[, ]", line)
+                if r2: w, h = int(r2.group(1)), int(r2.group(2))
             elif "Audio:" in line and a == "?":
                 m = re.search(r"Audio:\s*(\w+)", line)
                 if m: a = m.group(1)
@@ -255,7 +258,7 @@ def probe_file(fs_path: str) -> dict:
     except Exception as e:
         print(f"  [probe] {os.path.basename(fs_path)[:40]} -> {type(e).__name__}: {e}", flush=True)
     with _ENC_LOCK:
-        _PROBE_CACHE[key] = {"v": v, "a": a, "dur": dur}
+        _PROBE_CACHE[key] = {"v": v, "a": a, "dur": dur, "w": w, "h": h}
         return _PROBE_CACHE[key]
 
 
@@ -274,6 +277,40 @@ def gen_thumb_ffmpeg(fs_path: str, out_path: str) -> bool:
         except Exception:
             continue
     return False
+
+
+_THUMB_GEN_SEM = threading.Semaphore(1)   # 同时只截一帧，避免挤占播放的磁盘/编码器
+_THUMB_GEN_LOCK = threading.Lock()
+_THUMB_GEN_BUSY: set = set()
+_THUMB_FAIL: dict = {}                    # key -> 失败时间（10 分钟冷却，避免反复截坏文件）
+
+
+def ensure_thumb(fs_path: str, key: str) -> bool:
+    """确保某文件的缩略图已生成：现场截帧，带去重、单并发、失败冷却。"""
+    jpg = os.path.join(THUMB_DIR, key + ".jpg")
+    if os.path.isfile(jpg) and os.path.getsize(jpg) > 0:
+        return True
+    with _THUMB_GEN_LOCK:
+        if key in _THUMB_GEN_BUSY or time.time() - _THUMB_FAIL.get(key, 0) < 600:
+            return False
+        _THUMB_GEN_BUSY.add(key)
+    try:
+        os.makedirs(THUMB_DIR, exist_ok=True)
+        with _THUMB_GEN_SEM:
+            if os.path.isfile(jpg) and os.path.getsize(jpg) > 0:
+                return True
+            ok = gen_thumb_ffmpeg(fs_path, jpg)
+        if not ok:
+            with _THUMB_GEN_LOCK:
+                _THUMB_FAIL[key] = time.time()
+            try:
+                os.remove(jpg)
+            except OSError:
+                pass
+        return ok
+    finally:
+        with _THUMB_GEN_LOCK:
+            _THUMB_GEN_BUSY.discard(key)
 
 
 def play_mode(fs_path: str, ext: str, probe: dict) -> str:
@@ -1306,13 +1343,13 @@ const thumbObserver = new IntersectionObserver(entries=>{
 },{rootMargin:"150px"});
 
 function pumpThumbs(){
-  if(thumbPaused || thumbBusy || !thumbQueue.length) return;
+  if(thumbBusy || !thumbQueue.length) return;
   thumbBusy = true;
   const box = thumbQueue.shift();
   makeThumb(box).finally(()=>{ thumbBusy = false; pumpThumbs(); });
 }
 // 看门狗：任何原因导致的队列停顿都会被自动拉起
-setInterval(()=>{ if(!thumbPaused) pumpThumbs(); }, 2500);
+setInterval(()=>{ pumpThumbs(); }, 2500);
 
 function drawThumbFromURL(box, url, dur){
   const canvas = box.querySelector("canvas");
@@ -1370,7 +1407,9 @@ function makeThumb(box){
       }
     }catch(e){ /* 服务器没有缓存，走现场生成 */ }
 
-    // ③ 现场生成，然后写回本地缓存并上传给服务器供其他设备使用
+    // ③ 播放中不做本地解码生成（带宽让给播放流）；服务器缓存/截帧不受影响，
+    //    所以播放中卡片仍能从服务端拿到缩略图，只有浏览器解不了的且服务器截帧失败才留空
+    if(thumbPaused) return false;
     const v = document.createElement("video");
     v.muted = true; v.preload = "metadata"; v.playsInline = true;
     const done = ok => {
@@ -1871,6 +1910,7 @@ function openPlayerByPath(path){
   curItem = item;
   const v = $("#v");
   lastSaveAt = 0;
+  clearTimeout(v.__compatT);
   streamMode = "direct"; transStart = 0; effDur = 0; restarting = false; tbarDrag = false;
   stopTbar();
   v.controls = true;
@@ -1923,6 +1963,21 @@ function openPlayerByPath(path){
     v.play().catch(()=>{});
   };
   v.onloadeddata = ()=> drawVblur(true);   // 首帧就绪后画一次静态模糊背景，播放中保持不变
+  v.onplaying = ()=>{
+    // 有声无画：手机硬解不了该视频配置时，3.5 秒后自动切实时转码兼容播放
+    if(streamMode !== "direct" || !curItem || v.videoWidth){ clearTimeout(v.__compatT); return; }
+    clearTimeout(v.__compatT);
+    v.__compatT = setTimeout(()=>{
+      if(curItem && streamMode === "direct" && !v.paused && !v.ended && !v.videoWidth){
+        toast("画面解码失败，切换实时转码兼容播放…");
+        streamMode = "trans";
+        transStart = v.currentTime || 0;
+        lastPlayAbs = transStart; pendingSeek = -1;
+        v.controls = false; startTbar();
+        v.src = "/video?path=" + encodeURIComponent(curItem.path) + "&t=" + Math.round(transStart) + "&force=1";
+      }
+    }, 3500);
+  };
   const saveNow = ()=>{
     const t = vTime(), d = vDur();
     if(!curItem || !d || v.ended) return;
@@ -1969,6 +2024,7 @@ function openPlayerByPath(path){
   // 问服务器播放方式：direct=原生直读；cached=已有转码缓存当普通文件播；否则实时转码直推
   fetch("/api/info?path=" + encodeURIComponent(path)).then(r=>r.json()).then(d=>{
     if(!d.ok){ v.src = "/video?path=" + encodeURIComponent(path); return; }
+    if(d.res) addTag(d.res);
     if(d.v && d.v !== "?") addTag("编码 " + d.v.toUpperCase());
     if(d.dur){ addTag("时长 " + fmtTime(d.dur)); effDur = d.dur; }
     if(d.mode === "direct" || d.cached){
@@ -2236,13 +2292,14 @@ function stopPlayback(){
   saveCurProgress();
   const v = $("#v");
   v.pause();
+  clearTimeout(v.__compatT);
   stopTbar();
   streamMode = "direct"; transStart = 0; effDur = 0; restarting = false; tbarDrag = false;
   v.controls = true;
   thumbPaused = false;
   pumpThumbs();
   v.onloadedmetadata = v.ontimeupdate = v.onended = null;
-  v.onplay = v.onpause = v.onseeked = v.onseeking = v.onerror = null;
+  v.onplay = v.onpause = v.onseeked = v.onseeking = v.onerror = v.onplaying = null;
   v.removeAttribute("src"); v.load();
   vblur.style.display = "none";
   $("#player").classList.remove("on", "playing");
@@ -2425,9 +2482,10 @@ class Handler(BaseHTTPRequestHandler):
                 if mode != "direct":
                     key = thumb_key(fs_path)
                     cached = os.path.isfile(os.path.join(TRANSCACHE_DIR, key + ".mp4"))
+                res = f"{probe['w']}×{probe['h']}" if probe.get("w") else ""
                 return self._json({"ok": True, "v": probe.get("v"), "a": probe.get("a"),
                                    "mode": mode, "encoder": enc, "dur": probe.get("dur") or 0,
-                                   "cached": cached})
+                                   "res": res, "cached": cached})
             elif route == "/video":
                 self.stream_video()
             elif route == "/thumb":
@@ -2533,21 +2591,18 @@ class Handler(BaseHTTPRequestHandler):
         fs_path = resolve(self._params().get("path", ""))
         if fs_path is None or not os.path.isfile(fs_path):
             return self._error(404, "no thumb")
-        ext = os.path.splitext(fs_path)[1].lower()
         key = thumb_key(fs_path)
         jpg = os.path.join(THUMB_DIR, key + ".jpg")
         try:
             with open(jpg, "rb") as f:
                 data = f.read()
         except OSError:
-            # 缓存未命中：浏览器解不了的格式由 ffmpeg 服务端生成缩略图
-            ff = get_ffmpeg()
-            if ff and play_mode(fs_path, ext, probe_file(fs_path)) != "direct":
-                os.makedirs(THUMB_DIR, exist_ok=True)
-                if gen_thumb_ffmpeg(fs_path, jpg):
+            # 缓存未命中：用 ffmpeg 现场截帧补上（所有格式，一次生成永久缓存）
+            if get_ffmpeg() and ensure_thumb(fs_path, key):
+                try:
                     with open(jpg, "rb") as f:
                         data = f.read()
-                else:
+                except OSError:
                     return self._error(404, "no thumb")
             else:
                 return self._error(404, "no thumb")
@@ -2613,6 +2668,9 @@ class Handler(BaseHTTPRequestHandler):
 
         probe = probe_file(fs_path)
         mode = play_mode(fs_path, ext, probe)
+        # 兼容模式：客户端解不了画面（有声无画）时强制走转码
+        if params.get("force") == "1" and mode == "direct" and get_ffmpeg():
+            mode = "transcode"
         t_start = 0.0
         try:
             t_start = max(0.0, float(params.get("t") or 0))
@@ -2785,6 +2843,10 @@ HELP_TEXT = """
     直接粘贴文件夹路径回车  添加该文件夹为播放目录
     ls                    查看当前播放目录列表
     rm 别名                移除某个目录（不删除文件）
+    stat                  状态：目录、视频数、缓存占用
+    cc                    清空缩略图/转码缓存与预热记录（浏览网页时自动重建）
+    warm                  立即预热一遍全部目录（提前读文件，降低首次打开延迟）
+    open                  打开网页界面
     q                     停止服务并退出
     help                  显示本帮助
 """
@@ -2814,6 +2876,54 @@ def console_thread(server):
             for d in roots:
                 print(f"  {d['alias']}  ←  {d['path']}", flush=True)
             continue
+        if low in ("stat", "状态"):
+            for d in LIB.roots():
+                print(f"  {d['alias']}  ←  {d['path']}  （{count_videos(d['path'])} 个视频）", flush=True)
+            for label, folder in (("缩略图缓存 .thumbcache", THUMB_DIR),
+                                  ("转码缓存 .transcache", TRANSCACHE_DIR)):
+                n, size = 0, 0
+                if os.path.isdir(folder):
+                    for fn in os.listdir(folder):
+                        fp = os.path.join(folder, fn)
+                        if os.path.isfile(fp):
+                            n += 1
+                            try:
+                                size += os.path.getsize(fp)
+                            except OSError:
+                                pass
+                print(f"  {label}: {n} 个文件 / {size/1048576:.1f} MB", flush=True)
+            continue
+        if low in ("cc", "clear", "清缓存", "清理缓存"):
+            freed = 0
+            for folder in (THUMB_DIR, TRANSCACHE_DIR):
+                if os.path.isdir(folder):
+                    for fn in os.listdir(folder):
+                        fp = os.path.join(folder, fn)
+                        try:
+                            freed += os.path.getsize(fp)
+                            os.remove(fp)
+                        except OSError:
+                            pass
+            if os.path.isfile(WARM_FILE):
+                try:
+                    os.remove(WARM_FILE)
+                except OSError:
+                    pass
+            with _ENC_LOCK:
+                _PROBE_CACHE.clear()
+            print(f"  已清空缩略图/转码缓存，释放 {freed/1048576:.1f} MB（浏览网页时自动重建）", flush=True)
+            continue
+        if low in ("warm", "预热"):
+            roots = LIB.roots()
+            if roots:
+                print("  开始预热（后台进行，可继续输入命令）…", flush=True)
+                threading.Thread(target=warm_library, args=(roots, "手动"), daemon=True).start()
+            else:
+                print("  （还没有目录）", flush=True)
+            continue
+        if low in ("open", "打开"):
+            webbrowser.open(f"http://localhost:{server.server_address[1]}/")
+            continue
         if low.startswith(("rm ", "del ", "移除 ")):
             alias = line.split(None, 1)[1].strip()
             if LIB.remove(alias):
@@ -2834,7 +2944,8 @@ def console_thread(server):
                 LIB.save()
                 print(f"  已添加：{entry['alias']}  ←  {entry['path']}", flush=True)
                 if ARGS and not ARGS.no_warmup:
-                    threading.Thread(target=warm_library([entry], f"新目录 {entry['alias']}"), daemon=True).start()
+                    threading.Thread(target=warm_library, args=([entry], f"新目录 {entry['alias']}"),
+                                     daemon=True).start()
             except ValueError as e:
                 print(f"  {e}", flush=True)
 
