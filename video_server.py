@@ -238,6 +238,7 @@ def probe_file(fs_path: str) -> dict:
             return _PROBE_CACHE[key]
     v, a, dur = "?", "?", 0
     w = h = 0
+    fps = 0
     try:
         r = subprocess.run([get_ffmpeg(), "-hide_banner", "-i", fs_path],
                            capture_output=True, text=True, timeout=30,
@@ -248,6 +249,8 @@ def probe_file(fs_path: str) -> dict:
                 if m: v = m.group(1)
                 r2 = re.search(r"[, ](\d{2,5})x(\d{2,5})[, ]", line)
                 if r2: w, h = int(r2.group(1)), int(r2.group(2))
+                r3 = re.search(r"(\d+(?:\.\d+)?)\s*fps", line)
+                if r3: fps = float(r3.group(1))
             elif "Audio:" in line and a == "?":
                 m = re.search(r"Audio:\s*(\w+)", line)
                 if m: a = m.group(1)
@@ -258,7 +261,7 @@ def probe_file(fs_path: str) -> dict:
     except Exception as e:
         print(f"  [probe] {os.path.basename(fs_path)[:40]} -> {type(e).__name__}: {e}", flush=True)
     with _ENC_LOCK:
-        _PROBE_CACHE[key] = {"v": v, "a": a, "dur": dur, "w": w, "h": h}
+        _PROBE_CACHE[key] = {"v": v, "a": a, "dur": dur, "w": w, "h": h, "fps": fps}
         return _PROBE_CACHE[key]
 
 
@@ -1116,6 +1119,9 @@ main{position:relative;z-index:1;max-width:1200px;margin:0 auto;padding:20px 18p
   border-radius:11px;padding:10px 16px;font-size:13.5px;cursor:pointer}
 #renameBtn:active,#favBtn:active,#dlBtn:active{transform:scale(.97)}
 .pact{display:flex;gap:9px;margin:4px 0 6px;flex-wrap:wrap}
+@media (max-width:500px){
+  .pact button{flex:1 1 0;min-width:0;padding:10px 4px;font-size:13px;white-space:nowrap}
+}
 .moreh{margin:26px 0 12px;font-size:14px;font-weight:600;color:var(--text)}
 .moreh span{color:var(--dim);font-weight:400;font-size:12.5px}
 #more{margin-top:0;grid-template-columns:repeat(2,1fr)}
@@ -2003,8 +2009,8 @@ function openPlayerByPath(path){
   const ext = (item.name.split(".").pop()||"").toUpperCase();
   const p0 = getProgress()[path];
   if(p0 && p0.d) addTag("看到 " + Math.round(Math.min(100, p0.t/p0.d*100)) + "%", true);
-  // 其余信息等 /api/info 返回后合并成少量标签（格式·编码·分辨率 / 时长·大小 / 日期）
-  $("#restart").style.display = (p0 && p0.t > 5) ? "" : "none";
+  // 其余信息等 /api/info 返回后合并成少量标签（格式·编码·分辨率@帧率 / 时长·大小 / 日期）
+  // 「从头播放」常驻显示，保持页面一致
   $("#player").classList.add("on");
   document.body.classList.add("viewing");
   document.body.style.overflow = "hidden";
@@ -2095,7 +2101,10 @@ function openPlayerByPath(path){
     const spec = [];
     if(ext) spec.push(ext);
     if(d.v && d.v !== "?") spec.push(d.v.toUpperCase());
-    if(d.res) spec.push(d.res);
+    if(d.res){
+      const f = d.fps || 0;
+      spec.push(d.res + (f ? "@" + (Math.abs(f - Math.round(f)) < 0.05 ? Math.round(f) : f.toFixed(2)) : ""));
+    }
     if(spec.length) addTag(spec.join(" · "));
     const meta = [];
     if(d.dur){ meta.push(fmtTime(d.dur)); effDur = d.dur; }
@@ -2413,7 +2422,6 @@ $("#restart").addEventListener("click", ()=>{
   const v = $("#v");
   if(streamMode === "trans") pendingSeek = 0;   // 「从头播放」在转码流里=重启到 0 秒
   v.currentTime = 0; v.play().catch(()=>{});
-  $("#restart").style.display = "none";
   toast("从头开始播放");
 });
 
@@ -2585,9 +2593,10 @@ class Handler(BaseHTTPRequestHandler):
                     key = thumb_key(fs_path)
                     cached = os.path.isfile(os.path.join(TRANSCACHE_DIR, key + ".mp4"))
                 res = f"{probe['w']}×{probe['h']}" if probe.get("w") else ""
+                fps = probe.get("fps") or 0
                 return self._json({"ok": True, "v": probe.get("v"), "a": probe.get("a"),
                                    "mode": mode, "encoder": enc, "dur": probe.get("dur") or 0,
-                                   "res": res, "cached": cached})
+                                   "res": res, "fps": fps, "cached": cached})
             elif route == "/video":
                 self.stream_video()
             elif route == "/thumb":
