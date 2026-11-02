@@ -1120,9 +1120,9 @@ main{position:relative;z-index:1;max-width:1200px;margin:0 auto;padding:20px 18p
   border-radius:11px;padding:10px 16px;font-size:13.5px;cursor:pointer}
 #renameBtn:active,#favBtn:active,#dlBtn:active{transform:scale(.97)}
 .pact{display:flex;gap:9px;margin:4px 0 6px;flex-wrap:wrap}
-@media (max-width:380px){
-  .pact{gap:7px}
-  .pact button{padding:10px 9px;font-size:12.5px}
+@media (max-width:500px){
+  .pact{gap:8px}
+  .pact button{padding:10px 13px;font-size:12.5px}
 }
 .moreh{margin:26px 0 12px;font-size:14px;font-weight:600;color:var(--text)}
 .moreh span{color:var(--dim);font-weight:400;font-size:12.5px}
@@ -1232,10 +1232,10 @@ main{position:relative;z-index:1;max-width:1200px;margin:0 auto;padding:20px 18p
       <div class="ptitle" id="ptitle"></div>
       <div class="chips2" id="pchips"></div>
       <div class="pact">
-        <button id="restart">↻ 从头播放</button>
+        <button id="restart">从头播放</button>
         <button id="renameBtn">重命名</button>
-        <button id="favBtn">☆ 收藏</button>
-        <button id="dlBtn">⬇ 下载</button>
+        <button id="favBtn">收藏</button>
+        <button id="dlBtn">下载</button>
       </div>
       <div class="moreh" id="moreh" style="display:none"></div>
       <div class="grid" id="more" style="display:none"></div>
@@ -2109,8 +2109,11 @@ function openPlayerByPath(path){
     if(spec.length) addTag(spec.join(" · "));
     const meta = [];
     if(d.dur){ meta.push(fmtTime(d.dur)); effDur = d.dur; }
-    if(item.size) meta.push(fmtSize(item.size));
+    const sz = d.size || item.size;
+    if(sz) meta.push(fmtSize(sz));
     if(meta.length) addTag(meta.join(" · "));
+    const mt = d.mtime || item.mtime;
+    if(mt) addTag(fmtDate(mt));
     if(!d.ok){ v.src = "/video?path=" + encodeURIComponent(path); return; }   // info 失败按原生播
     if(d.mode === "direct" || d.cached){
       v.src = "/video?path=" + encodeURIComponent(path);
@@ -2127,7 +2130,9 @@ function openPlayerByPath(path){
     startTbar();
     v.src = "/video?path=" + encodeURIComponent(path) + "&t=" + Math.round(transStart);
   }).catch(()=>{
-    if(item.size) addTag(fmtSize(item.size));
+    const sz = item.size;
+    if(sz) addTag(fmtSize(sz));
+    if(item.mtime) addTag(fmtDate(item.mtime));
     v.src = "/video?path=" + encodeURIComponent(path);
   });
   loadMore(path, folder);
@@ -2593,9 +2598,11 @@ class Handler(BaseHTTPRequestHandler):
                     cached = os.path.isfile(os.path.join(TRANSCACHE_DIR, key + ".mp4"))
                 res = f"{probe['w']}×{probe['h']}" if probe.get("w") else ""
                 fps = probe.get("fps") or 0
+                st = os.stat(fs_path)
                 return self._json({"ok": True, "v": probe.get("v"), "a": probe.get("a"),
                                    "mode": mode, "encoder": enc, "dur": probe.get("dur") or 0,
-                                   "res": res, "fps": fps, "cached": cached})
+                                   "res": res, "fps": fps, "cached": cached,
+                                   "size": st.st_size, "mtime": int(st.st_mtime)})
             elif route == "/video":
                 self.stream_video()
             elif route == "/thumb":
