@@ -987,6 +987,7 @@ html[data-theme="light"]{
   color-scheme:light;
 }
 *{box-sizing:border-box;margin:0;padding:0;-webkit-tap-highlight-color:transparent}
+html{-webkit-text-size-adjust:100%;text-size-adjust:100%}   /* 禁止移动浏览器自动放大文字（Via 字体加宽的根源） */
 html{color-scheme:dark}
 body{background:var(--bg);color:var(--text);
   font-family:-apple-system,BlinkMacSystemFont,"Segoe UI","PingFang SC","Microsoft YaHei",sans-serif;
@@ -1107,9 +1108,9 @@ main{position:relative;z-index:1;max-width:1200px;margin:0 auto;padding:20px 18p
 .ptitle{font-size:17px;font-weight:650;line-height:1.55;word-break:break-all;cursor:pointer;
   display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical;overflow:hidden}
 .ptitle.open{-webkit-line-clamp:unset;display:block}
-.chips2{display:flex;flex-wrap:wrap;gap:7px;margin:12px 0}
-.tag{font-size:12px;color:var(--dim);background:var(--panel);border:1px solid var(--line);
-  border-radius:9px;padding:4px 10px;white-space:nowrap}
+.chips2{display:flex;flex-wrap:wrap;gap:6px;margin:12px 0}
+.tag{font-size:11px;color:var(--dim);background:var(--panel);border:1px solid var(--line);
+  border-radius:9px;padding:4px 9px;white-space:nowrap}
 .tag.hl{color:var(--hl-text);border-color:var(--hl-border);background:var(--hl-bg)}
 #restart{background:var(--grad);border:none;color:#fff;border-radius:11px;
   padding:10px 18px;font-size:13.5px;font-weight:500;cursor:pointer;
@@ -1119,10 +1120,9 @@ main{position:relative;z-index:1;max-width:1200px;margin:0 auto;padding:20px 18p
   border-radius:11px;padding:10px 16px;font-size:13.5px;cursor:pointer}
 #renameBtn:active,#favBtn:active,#dlBtn:active{transform:scale(.97)}
 .pact{display:flex;gap:9px;margin:4px 0 6px;flex-wrap:wrap}
-@media (max-width:640px){
-  .pact{gap:8px}
-  .pact button{flex:1 1 0;min-width:0;padding:10px 2px;font-size:12.5px;white-space:nowrap}
-  .pact #restart{flex-grow:1.18}   /* 标签最长的按钮多分一点宽度，避免文字溢出 */
+@media (max-width:380px){
+  .pact{gap:7px}
+  .pact button{padding:10px 9px;font-size:12.5px}
 }
 .moreh{margin:26px 0 12px;font-size:14px;font-weight:600;color:var(--text)}
 .moreh span{color:var(--dim);font-weight:400;font-size:12.5px}
@@ -2101,7 +2101,6 @@ function openPlayerByPath(path){
   fetch("/api/info?path=" + encodeURIComponent(path)).then(r=>r.json()).then(d=>{
     d = d.ok ? d : {};
     const spec = [];
-    if(ext) spec.push(ext);
     if(d.v && d.v !== "?") spec.push(d.v.toUpperCase());
     if(d.res){
       const f = d.fps || 0;
@@ -2112,7 +2111,6 @@ function openPlayerByPath(path){
     if(d.dur){ meta.push(fmtTime(d.dur)); effDur = d.dur; }
     if(item.size) meta.push(fmtSize(item.size));
     if(meta.length) addTag(meta.join(" · "));
-    if(item.mtime) addTag(fmtDate(item.mtime));
     if(!d.ok){ v.src = "/video?path=" + encodeURIComponent(path); return; }   // info 失败按原生播
     if(d.mode === "direct" || d.cached){
       v.src = "/video?path=" + encodeURIComponent(path);
@@ -2130,7 +2128,6 @@ function openPlayerByPath(path){
     v.src = "/video?path=" + encodeURIComponent(path) + "&t=" + Math.round(transStart);
   }).catch(()=>{
     if(item.size) addTag(fmtSize(item.size));
-    if(item.mtime) addTag(fmtDate(item.mtime));
     v.src = "/video?path=" + encodeURIComponent(path);
   });
   loadMore(path, folder);
