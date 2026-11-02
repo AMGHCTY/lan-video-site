@@ -1,8 +1,0 @@
-HTTP/1.1 500 Internal Server Error
-Server: LANVideo/3.0 Python/3.15.0
-Date: Sun, 01 Nov 2026 15:01:50 GMT
-Content-Type: text/plain; charset=utf-8
-Content-Length: 55
-Cache-Control: no-store
-
-服务器内部错误: name 'serve_path' is not defined
