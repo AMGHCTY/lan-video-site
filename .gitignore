@@ -2,9 +2,13 @@
 视频/
 .thumbcache/
 .transcache/
+.subscache/
 library.json
 favorites.json
 .warmcache.json
+progress.json
+settings.json
+连接二维码.png
 *.tmp
 
 # 构建产物：便携包 zip 只发布到 GitHub Releases
