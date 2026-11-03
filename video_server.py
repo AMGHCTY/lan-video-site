@@ -22,6 +22,8 @@
 import argparse
 import ctypes
 import hashlib
+import hmac
+import ipaddress
 import json
 import os
 import re
@@ -34,6 +36,7 @@ import time
 import urllib.parse
 import uuid
 import webbrowser
+from html import escape as html_escape
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 # 支持列出的视频扩展名（浏览器能否直接播放取决于编码，mp4/webm 兼容性最好）
@@ -46,6 +49,8 @@ VIDEO_EXTS = {
 FASTSTART_EXTS = {".mp4", ".m4v", ".mov"}   # 可虚拟重排索引的容器
 CHUNK = 1024 * 1024                          # 流式传输块大小 1MB
 SEARCH_LIMIT = 300
+MAX_UPLOAD_BYTES = 32 * 1024 * 1024 * 1024   # 单文件上传上限 32GB
+VERSION = "1.2.0"                            # 唯一版本号来源（页头/横幅/Server 头共用）
 
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 CONFIG_FILE = os.path.join(SCRIPT_DIR, "library.json")
@@ -65,7 +70,50 @@ BROWSER_CONTAINER = {".mp4", ".m4v", ".mov", ".webm"}
 
 # ================================================================ 访问密码（可选）
 
-AUTH = {"hash": "", "salt": ""}   # 非空 = 已开启密码，网页访问需先登录
+AUTH = {"hash": "", "salt": "", "rounds": 0}   # 非空 = 已开启密码，网页访问需先登录
+# rounds=0 表示旧版单轮 sha256(salt+pw) 格式，登录成功后自动升级为 PBKDF2
+
+# IP 白名单：空列表 = 放行所有 IP。元素可以是单个 IP（192.168.1.5）或 CIDR（192.168.1.0/24）
+ALLOW = {"list": []}
+
+
+def _parse_allow(entries) -> list:
+    """把用户输入的条目规范成字符串列表，非法条目丢弃。"""
+    out = []
+    for raw in entries or []:
+        s = str(raw).strip()
+        if not s:
+            continue
+        try:
+            ipaddress.ip_network(s, strict=False)   # 单 IP 也能当 /32、/128 解析
+            out.append(s)
+        except ValueError:
+            print(f"  ⚠ 白名单条目无效，已忽略：{s}", flush=True)
+    return out
+
+
+def ip_allowed(ip: str) -> bool:
+    """白名单为空时放行全部；否则要求命中某条 IP 或 CIDR。"""
+    rules = ALLOW["list"]
+    if not rules:
+        return True
+    try:
+        addr = ipaddress.ip_address(ip)
+    except ValueError:
+        return False
+    for rule in rules:
+        try:
+            if addr in ipaddress.ip_network(rule, strict=False):
+                return True
+        except ValueError:
+            continue
+    return False
+
+
+def set_allow(entries):
+    ALLOW["list"] = _parse_allow(entries)
+    AUTH["allow"] = list(ALLOW["list"])
+    save_settings()
 
 
 def load_settings():
@@ -76,6 +124,12 @@ def load_settings():
             if isinstance(d, dict):
                 AUTH["hash"] = str(d.get("hash") or "")
                 AUTH["salt"] = str(d.get("salt") or "")
+                try:
+                    AUTH["rounds"] = int(d.get("rounds") or 0)
+                except (TypeError, ValueError):
+                    AUTH["rounds"] = 0
+                ALLOW["list"] = _parse_allow(d.get("allow") or [])
+                AUTH["allow"] = list(ALLOW["list"])
         except Exception:
             pass
 
@@ -90,14 +144,25 @@ def save_settings():
         print(f"  ⚠ 保存 settings.json 失败：{e}", flush=True)
 
 
+PBKDF2_ROUNDS = 200_000
+
+
+def _hash_password(pw: str, salt: str, rounds: int) -> str:
+    """PBKDF2-HMAC-SHA256：比单轮 sha256 抗离线爆破强得多。"""
+    return hashlib.pbkdf2_hmac("sha256", pw.encode("utf-8"),
+                               salt.encode("utf-8"), rounds).hex()
+
+
 def set_password(pw: str):
     AUTH["salt"] = uuid.uuid4().hex
-    AUTH["hash"] = hashlib.sha256((AUTH["salt"] + pw).encode("utf-8")).hexdigest()
+    AUTH["rounds"] = PBKDF2_ROUNDS
+    AUTH["hash"] = _hash_password(pw, AUTH["salt"], PBKDF2_ROUNDS)
     save_settings()
 
 
 def clear_password():
     AUTH["hash"] = AUTH["salt"] = ""
+    AUTH["rounds"] = 0
     save_settings()
 
 
@@ -108,13 +173,51 @@ def auth_token() -> str:
 
 
 def auth_ok(handler) -> bool:
-    """未设密码恒真；已设密码时校验 Cookie（登录页/图标除外）。"""
+    """未设密码恒真；已设密码时精确校验 Cookie（登录页/图标除外）。"""
     if not AUTH["hash"]:
         return True
     route = urllib.parse.urlsplit(handler.path).path
     if route in ("/login", "/manifest.webmanifest", "/icon.svg", "/favicon.ico"):
         return True
-    return ("lvpw=" + auth_token()) in (handler.headers.get("Cookie") or "")
+    return _cookie_get(handler, "lvpw") == auth_token()
+
+
+def _cookie_get(handler, name: str) -> str:
+    """按 RFC 6265 精确解析 Cookie 头，只认 `name=value` 完全相等的那个。"""
+    raw = handler.headers.get("Cookie") or ""
+    for part in raw.split(";"):
+        k, sep, v = part.strip().partition("=")
+        if sep and k.strip() == name:
+            return v.strip()
+    return ""
+
+
+# ---- 登录失败限速：同一 IP 连续失败后指数退避，防在线爆破 ----
+_LOGIN_FAIL = {}            # ip -> [失败次数, 上次失败时间, 锁定到期时间]
+_LOGIN_LOCK = threading.Lock()
+LOGIN_MAX_TRIES = 8         # 连续失败 8 次开始锁定
+LOGIN_LOCK_SECONDS = 300    # 锁 5 分钟
+
+
+def _login_allowed(ip: str) -> bool:
+    with _LOGIN_LOCK:
+        rec = _LOGIN_FAIL.get(ip)
+        return not (rec and rec[2] > time.time())
+
+
+def _login_failed(ip: str):
+    with _LOGIN_LOCK:
+        rec = _LOGIN_FAIL.setdefault(ip, [0, 0.0, 0.0])
+        rec[0] += 1
+        rec[1] = time.time()
+        if rec[0] >= LOGIN_MAX_TRIES:
+            rec[2] = time.time() + LOGIN_LOCK_SECONDS
+            rec[0] = 0          # 锁定期过后重新计数
+
+
+def _login_succeeded(ip: str):
+    with _LOGIN_LOCK:
+        _LOGIN_FAIL.pop(ip, None)
 
 
 LOGIN_PAGE = """<!DOCTYPE html>
@@ -170,7 +273,12 @@ class Library:
             try:
                 with open(CONFIG_FILE, encoding="utf-8") as f:
                     data = json.load(f)
-                for d in data.get("dirs", []):
+                # 容错：手改成裸数组（[{"path": ...}]）也能读，不再直接崩在启动阶段
+                dirs = data if isinstance(data, list) else (
+                    data.get("dirs", []) if isinstance(data, dict) else [])
+                if not isinstance(dirs, list):
+                    dirs = []
+                for d in dirs:
                     # 目录暂时不可用（如 U 盘未插）也保留，重新挂载后自动恢复
                     if isinstance(d, dict) and isinstance(d.get("path"), str):
                         loaded.append({
@@ -262,8 +370,30 @@ class Library:
 LIB = Library()
 
 
+WINDOWS_RESERVED = {"CON", "PRN", "AUX", "NUL",
+                    "COM1", "COM2", "COM3", "COM4", "COM5", "COM6", "COM7", "COM8", "COM9",
+                    "LPT1", "LPT2", "LPT3", "LPT4", "LPT5", "LPT6", "LPT7", "LPT8", "LPT9"}
+
+
+def safe_filename(name: str) -> str | None:
+    """校验用户提交的文件名：返回清洗后的名字，非法则返回 None。"""
+    name = (name or "").strip().rstrip(" .")
+    if not name:
+        return None
+    if any(c in name for c in '\\/:*?"<>|\x00'):
+        return None
+    if name.startswith("."):
+        return None
+    # Windows 设备名（CON/PRN/NUL/COM1…）不能作为文件名，即使带扩展名也不行
+    if os.path.splitext(name)[0].upper() in WINDOWS_RESERVED:
+        return None
+    return name
+
+
 def resolve(rel: str):
-    """把 `<别名>/子路径` 解析为绝对路径，并确保不越出对应根目录。"""
+    """把 `<别名>/子路径` 解析为绝对路径，并确保不越出对应根目录。
+    用 realpath 归一化后再比前缀，挡掉符号链接/junction 逃逸；
+    用 normcase 归一化大小写，避免 Windows 上盘符大小写不一致导致误判。"""
     rel = (rel or "").strip().replace("\\", "/")
     parts = [p for p in rel.split("/") if p not in ("", ".")]
     if not parts or any(p == ".." for p in parts):
@@ -271,10 +401,19 @@ def resolve(rel: str):
     entry = LIB.by_alias(parts[0])
     if not entry:
         return None
-    root = os.path.abspath(entry["path"])
-    target = os.path.abspath(os.path.join(root, *parts[1:])) if len(parts) > 1 else root
-    if target != root and not target.startswith(root + os.sep):
+    try:
+        root = os.path.realpath(os.path.abspath(entry["path"]))
+        target = os.path.realpath(os.path.join(root, *parts[1:])) if len(parts) > 1 else root
+    except OSError:
         return None
+    # 用 normcase 做大小写归一，用 commonpath 避免 "D:\\" + sep 这种双斜杠漏判
+    if os.path.normcase(target) != os.path.normcase(root):
+        try:
+            if os.path.commonpath([os.path.normcase(root),
+                                   os.path.normcase(target)]) != os.path.normcase(root):
+                return None
+        except ValueError:      # 不同盘符
+            return None
     return target
 
 
@@ -320,6 +459,17 @@ def get_ffmpeg() -> str | None:
     return exe
 
 
+_CACHE_MAX = 4000   # 各内存缓存的上限，防止长期运行无限增长
+
+
+def _cache_put(cache: dict, key, val):
+    """写入并裁剪：超过上限时清掉最旧的一半（dict 保插入顺序）。"""
+    cache[key] = val
+    if len(cache) > _CACHE_MAX:
+        for k in list(cache)[: len(cache) // 2]:
+            cache.pop(k, None)
+
+
 def probe_file(fs_path: str) -> dict:
     """用 ffmpeg -i 探测视频/音频编码与时长（结果按文件缓存）。"""
     st = os.stat(fs_path)
@@ -341,8 +491,14 @@ def probe_file(fs_path: str) -> dict:
                 if m: v = m.group(1)
                 r2 = re.search(r"[, ](\d{2,5})x(\d{2,5})[, ]", line)
                 if r2: w, h = int(r2.group(1)), int(r2.group(2))
-                r3 = re.search(r"(\d+(?:\.\d+)?)\s*fps", line)
-                if r3: fps = float(r3.group(1))
+                # 先试分数帧率（30000/1001），再试小数/整数（29.97 / 25）
+                r3 = re.search(r"(\d+)/(\d+)\s*fps", line)
+                if r3:
+                    den = int(r3.group(2))
+                    fps = round(int(r3.group(1)) / den, 3) if den else 0
+                else:
+                    r3 = re.search(r"(\d+(?:\.\d+)?)\s*fps", line)
+                    if r3: fps = float(r3.group(1))
             elif "Audio:" in line and a == "?":
                 m = re.search(r"Audio:\s*(\w+)", line)
                 if m: a = m.group(1)
@@ -355,7 +511,8 @@ def probe_file(fs_path: str) -> dict:
     except Exception as e:
         print(f"  [probe] {os.path.basename(fs_path)[:40]} -> {type(e).__name__}: {e}", flush=True)
     with _ENC_LOCK:
-        _PROBE_CACHE[key] = {"v": v, "a": a, "dur": dur, "w": w, "h": h, "fps": fps, "subs": subs}
+        _cache_put(_PROBE_CACHE, key,
+                   {"v": v, "a": a, "dur": dur, "w": w, "h": h, "fps": fps, "subs": subs})
         return _PROBE_CACHE[key]
 
 
@@ -382,6 +539,7 @@ _THUMB_GEN_SEM = threading.Semaphore(1)   # 同时只截一帧，避免挤占播
 _THUMB_GEN_LOCK = threading.Lock()
 _THUMB_GEN_BUSY: set = set()
 _THUMB_FAIL: dict = {}                    # key -> 失败时间（10 分钟冷却，避免反复截坏文件）
+_THUMB_BATCH = {"running": False, "stop": False}   # 批量生成缩略图任务的运行状态
 
 
 def ensure_thumb(fs_path: str, key: str) -> bool:
@@ -401,7 +559,7 @@ def ensure_thumb(fs_path: str, key: str) -> bool:
             ok = gen_thumb_ffmpeg(fs_path, jpg)
         if not ok:
             with _THUMB_GEN_LOCK:
-                _THUMB_FAIL[key] = time.time()
+                _cache_put(_THUMB_FAIL, key, time.time())
             try:
                 os.remove(jpg)
             except OSError:
@@ -417,7 +575,8 @@ def play_mode(fs_path: str, ext: str, probe: dict) -> str:
     if not get_ffmpeg():
         return "direct"   # 没有 ffmpeg 只能直读
     v_ok = probe.get("v") in BROWSER_VIDEO
-    a_ok = probe.get("a") in BROWSER_AUDIO
+    # 没有音轨（probe 得到 "?"）不该算"音频不兼容"，否则无声视频会被白白重编码一遍
+    a_ok = probe.get("a") in BROWSER_AUDIO or probe.get("a") == "?"
     c_ok = ext in BROWSER_CONTAINER
     if v_ok and a_ok and c_ok:
         return "direct"
@@ -485,7 +644,26 @@ def transcode_cmd(fs_path: str, mode: str, t_start: float, q: str = "") -> list:
     return cmd
 
 
-_TRANSCODE_SEM = threading.Semaphore(2)   # 最多同时 2 路实时转码
+_TRANSCODE_SEM = None                          # 惰性建：硬编 3 路 / 软编 2 路（见 transcode_sem）
+_TRANSCODE_SEM_LOCK = threading.Lock()
+
+
+def transcode_sem() -> threading.BoundedSemaphore:
+    """转码并发闸门：GPU 硬编快、吃的是显卡，可以 3 路并行；CPU 软编保持 2 路防过载。
+    首次转码时才探测编码器并建信号量。"""
+    global _TRANSCODE_SEM
+    if _TRANSCODE_SEM is None:
+        with _TRANSCODE_SEM_LOCK:
+            if _TRANSCODE_SEM is None:
+                n = 2
+                try:
+                    label = (pick_video_encoder()[2] or "").upper()
+                    if "GPU (" in label or any(k in label for k in ("NVENC", "QSV", "AMF")):
+                        n = 3
+                except Exception:
+                    pass
+                _TRANSCODE_SEM = threading.BoundedSemaphore(n)
+    return _TRANSCODE_SEM
 
 
 def is_removable_drive(fs_path: str) -> bool:
@@ -519,7 +697,7 @@ def count_videos(fs_dir: str, cap: int = 5000) -> int:
                 break
     except OSError:
         pass
-    _COUNT_CACHE[fs_dir] = (now, n)
+    _cache_put(_COUNT_CACHE, fs_dir, (now, n))
     return n
 
 
@@ -537,7 +715,7 @@ def first_video(fs_dir: str) -> str:
                     best = e.name
     except OSError:
         pass
-    _COVER_CACHE[fs_dir] = (now, best)
+    _cache_put(_COVER_CACHE, fs_dir, (now, best))
     return best
 
 
@@ -640,37 +818,80 @@ def save_progress(d: dict):
         pass
 
 
-def progress_set(rel: str, t: float, d: float):
-    """记录/清除（t 小于 5 秒或已播过 95% 视为看完，清除记录）。"""
+def progress_set(rel: str, t: float, d: float, w=None):
+    """记录/清除观看进度，可选「已看」标记。
+
+    w=1 手动标记已看，w=0 取消标记（连记录一起清，等于从头再看）。
+    播完（t ≥ 95%）自动带上已看标记；已看条目不再被清除，重新点开从头看也不丢标记。
+    """
     rel_norm = "/".join(p for p in rel.replace("\\", "/").split("/") if p and p != ".")
     fs = resolve(rel_norm)
     if fs is None or not os.path.isfile(fs):
         return False
     p = load_progress()
-    if d > 0 and t > 5 and t < d * 0.95:
+    old = p.get(rel_norm) or {}
+    watched = old.get("w") == 1
+
+    def make(tt, dd, ww=False):
         st = os.stat(fs)
-        p[rel_norm] = {"t": round(t, 1), "d": round(d, 1), "u": int(time.time()),
-                       "name": os.path.basename(fs), "size": st.st_size,
-                       "mtime": int(st.st_mtime)}
-    else:
+        ent = {"t": round(tt, 1), "d": round(dd, 1), "u": int(time.time()),
+               "name": os.path.basename(fs), "size": st.st_size,
+               "mtime": int(st.st_mtime)}
+        if ww:
+            ent["w"] = 1
+        return ent
+
+    if w == 1:                              # 手动标记已看（时长用旧记录或本次上报的）
+        dd = old.get("d") or (d if d > 0 else 0)
+        p[rel_norm] = make(old.get("t", 0) or dd, dd, True)
+    elif w == 0:                            # 取消已看：记录一并清掉
         p.pop(rel_norm, None)
+    elif d > 0 and t >= 5 and t < d * 0.95:  # 看到中间：正常进度
+        p[rel_norm] = make(t, d, watched)
+    elif d > 0 and t >= d * 0.95:           # 播完：自动标记已看并保留记录
+        p[rel_norm] = make(d, d, True)
+    else:                                   # 几乎没看（t < 5 秒）
+        if watched:                         # 保留已看标记，进度归零
+            p[rel_norm] = make(0, old.get("d") or d or 0, True)
+        else:
+            p.pop(rel_norm, None)
     save_progress(p)
     return True
 
 
 def progress_validated() -> dict:
-    """返回有效进度：源文件已被删掉（应用外删除）的条目顺带清理。"""
+    """返回有效进度：源文件已被删掉（应用外删除）的条目顺带清理。
+
+    被清理掉的键同时记到 _PURGED，供前端把本地 localStorage 里的同名记录一并删掉，
+    否则首页会留下「1 KB / 1970-01-01」这种打不开的空卡片。
+    """
     p = load_progress()
-    out, changed = {}, False
+    out, gone = {}, []
     for k, v in p.items():
         fs = resolve(k)
         if fs is not None and os.path.isfile(fs):
             out[k] = v
         else:
-            changed = True
-    if changed:
+            gone.append(k)
+    if gone:
         save_progress(out)
+        with _PURGE_LOCK:
+            _PURGED.update(gone)
     return out
+
+
+_PURGED = set()                  # 最近一次校验被清掉的路径
+_PURGE_LOCK = threading.Lock()
+
+
+def progress_take_purged() -> list:
+    """取出并清空待通知前端的失效记录列表。"""
+    with _PURGE_LOCK:
+        if not _PURGED:
+            return []
+        out = sorted(_PURGED)
+        _PURGED.clear()
+        return out
 
 
 def progress_rename(old_rel: str, new_rel: str):
@@ -695,6 +916,41 @@ def progress_delete(paths):
             changed = True
     if changed:
         save_progress(p)
+
+
+# ---- 删除进回收站（可反悔），失败（网络盘等不支持回收站的场景）回退直接删 ----
+
+def recycle_file(path: str) -> bool:
+    """把文件移入 Windows 回收站；非 Windows 或回收站不支持时返回 False。
+
+    用 shell32.SHFileOperationW + FOF_ALLOWUNDO，纯标准库实现（ctypes）。
+    pFrom 需要双 \0 结尾，ctypes 自动补一个，所以字符串末尾再放一个。
+    """
+    if os.name != "nt" or not path:
+        return False
+    try:
+        import ctypes
+        from ctypes import wintypes
+
+        class SHFILEOPSTRUCTW(ctypes.Structure):
+            _fields_ = [("hwnd", wintypes.HWND), ("wFunc", ctypes.c_uint),
+                        ("pFrom", wintypes.LPCWSTR), ("pTo", wintypes.LPCWSTR),
+                        ("fFlags", ctypes.c_uint16), ("fAnyOperationsAborted", wintypes.BOOL),
+                        ("hNameMappings", ctypes.c_void_p),
+                        ("lpszProgressTitle", wintypes.LPCWSTR)]
+
+        op = SHFILEOPSTRUCTW()
+        op.hwnd = None
+        op.wFunc = 3            # FO_DELETE
+        op.pFrom = path + "\0"
+        op.pTo = None
+        # FOF_ALLOWUNDO | FOF_NOCONFIRMATION | FOF_SILENT | FOF_NOERRORUI
+        op.fFlags = 0x40 | 0x10 | 0x04 | 0x400
+        if ctypes.windll.shell32.SHFileOperationW(ctypes.byref(op)) != 0:
+            return False
+        return not op.fAnyOperationsAborted
+    except Exception:
+        return False
 
 
 # ================================================================ 字幕（外挂 srt/ass + 内封字幕 → WebVTT）
@@ -944,7 +1200,7 @@ def build_faststart(src: str, st):
 _FS_CACHE = {}      # (路径, mtime, size) -> Faststart 或 None
 _FS_ORDER = []
 _FS_GUARD = threading.Lock()
-_FS_BUILD_LOCKS = {}
+_FS_BUILD_LOCKS = {}    # 路径 -> Lock，随 _FS_CACHE 淘汰一起回收，避免长跑无限增长
 
 
 def get_faststart(src: str):
@@ -956,7 +1212,9 @@ def get_faststart(src: str):
     with _FS_GUARD:
         if key in _FS_CACHE:
             return _FS_CACHE[key]
-    lk = _FS_BUILD_LOCKS.setdefault(key[0], threading.Lock())
+        lk = _FS_BUILD_LOCKS.get(key[0])
+        if lk is None:
+            lk = _FS_BUILD_LOCKS[key[0]] = threading.Lock()
     with lk:
         with _FS_GUARD:
             if key in _FS_CACHE:
@@ -968,6 +1226,8 @@ def get_faststart(src: str):
             while len(_FS_ORDER) > 8:         # 只保留最近用到的几部片的重排信息
                 old = _FS_ORDER.pop(0)
                 _FS_CACHE.pop(old, None)
+                if not any(k[0] == old[0] for k in _FS_CACHE):
+                    _FS_BUILD_LOCKS.pop(old[0], None)   # 没有其他 mtime 版本时一并回收
         return fs
 
 
@@ -1266,6 +1526,66 @@ def prune_thumbcache():
         print(f"  ♨ 已清理 {removed} 个失效缩略图缓存", flush=True)
 
 
+def gen_all_thumbs(roots, label="全部目录"):
+    """批量生成所有视频的缩略图（控制台 `thumb` 命令）。
+
+    缩略图原本是"浏览到才生成"，所以没被翻到的视频一直没有封面。
+    这里把库里所有视频走一遍，缺哪个补哪个，已存在的直接跳过。
+    用 _THUMB_GEN_SEM 与网页请求共用同一个并发闸门，不会挤爆磁盘。
+    """
+    if not get_ffmpeg():
+        print("  ✗ 没找到 ffmpeg，无法生成缩略图", flush=True)
+        return
+    _THUMB_BATCH["running"] = True
+    _THUMB_BATCH["stop"] = False
+    started = time.time()
+    made = skipped = failed = 0
+    try:
+        # 先收集全部视频，才能显示准确进度
+        todo = []
+        for entry in roots:
+            for dirpath, dirnames, filenames in os.walk(entry["path"]):
+                dirnames[:] = [d for d in dirnames if not d.startswith((".", "$"))]
+                for name in filenames:
+                    if is_video(name):
+                        todo.append(os.path.join(dirpath, name))
+        total = len(todo)
+        if not total:
+            print("  （目录里没有视频）", flush=True)
+            return
+        print(f"  开始生成缩略图：共 {total} 个视频（{label}）", flush=True)
+        for i, p in enumerate(todo, 1):
+            if _THUMB_BATCH["stop"]:
+                print("  ⏹ 已中断", flush=True)
+                break
+            try:
+                key = thumb_key(p)
+            except OSError:
+                failed += 1
+                continue
+            jpg = os.path.join(THUMB_DIR, key + ".jpg")
+            if os.path.isfile(jpg) and os.path.getsize(jpg) > 0:
+                skipped += 1
+                continue
+            # 批量模式下清掉失败冷却：上次失败可能只是临时占用/休眠磁盘
+            with _THUMB_GEN_LOCK:
+                _THUMB_FAIL.pop(key, None)
+            ok = ensure_thumb(p, key)
+            if ok:
+                made += 1
+            else:
+                failed += 1
+            if i % 20 == 0 or i == total:
+                print(f"    进度 {i}/{total} · 新生成 {made} · 已有 {skipped} · 失败 {failed}", flush=True)
+    finally:
+        _THUMB_BATCH["running"] = False
+        cost = time.time() - started
+        print(f"  ✓ 缩略图生成结束：新生成 {made} 个，已有 {skipped} 个，"
+              f"失败 {failed} 个，用时 {cost:.0f} 秒", flush=True)
+        if failed:
+            print("    失败的多为损坏文件、加密视频或读不到的网络盘，可稍后重试", flush=True)
+
+
 # ================================================================ 页面
 
 PAGE = r"""<!DOCTYPE html>
@@ -1357,6 +1677,10 @@ main{position:relative;z-index:1;max-width:1200px;margin:0 auto;padding:20px 18p
 .sec.wide{grid-column:1/-1;margin:8px 0 4px}
 .sec.wide:first-child{margin-top:0}
 .sec h2{font-size:15.5px;font-weight:600}
+/* 可点击的区块标题（「▶ 播放记录」→ 独立页面） */
+.sec h2.seclink{cursor:pointer;border-radius:8px;transition:.15s;padding:2px 6px;margin:-2px -6px}
+.sec h2.seclink:hover{background:var(--panel);color:var(--acc)}
+.sec h2.seclink::after{content:"›";margin-left:6px;color:var(--dim);font-weight:400}
 .sec span{font-size:12.5px;color:var(--dim)}
 #crumb{display:flex;flex-wrap:wrap;gap:6px;align-items:center;font-size:13px;color:var(--dim);margin-bottom:4px}
 #crumb a{color:var(--dim);text-decoration:none;background:var(--panel);border:1px solid var(--line);
@@ -1436,6 +1760,38 @@ main{position:relative;z-index:1;max-width:1200px;margin:0 auto;padding:20px 18p
 #tbar button{background:none;border:none;color:#fff;font-size:16px;line-height:1;
   padding:6px 4px;cursor:pointer;opacity:.92}
 #tbar button:active{transform:scale(.94)}
+/* 播放设置入口：常驻视频右上角，直读/转码两种模式都能用 */
+#tset{position:absolute;top:calc(12px + env(safe-area-inset-top));right:14px;z-index:6;
+  width:40px;height:40px;border-radius:50%;border:1px solid var(--back-border);
+  background:var(--back-bg);color:var(--back-text);font-size:17px;line-height:1;cursor:pointer;
+  display:flex;align-items:center;justify-content:center;padding:0;
+  backdrop-filter:blur(10px);-webkit-backdrop-filter:blur(10px)}
+#tset:hover{background:rgba(10,12,16,.75)}
+/* 播放中自动隐藏 ← 与 ⚙：两者节奏分开，齿轮跟原生控件条一起走 */
+#back{transition:opacity .28s ease, transform .28s ease}
+#tset{transition:opacity .16s ease, transform .16s ease}
+.vwrap.backhide #back{opacity:0;transform:scale(.86);pointer-events:none}
+.vwrap.gearhide #tset{opacity:0;transform:scale(.86);pointer-events:none}
+/* 播放设置面板：倍速/画质/字幕/截图/练习都收进这里，页面上不再铺一行按钮 */
+#tsheet{position:absolute;left:12px;right:12px;bottom:52px;z-index:7;display:none;
+  flex-direction:column;gap:9px;padding:12px 13px;border-radius:14px;
+  max-height:calc(100% - 70px);overflow-y:auto;-webkit-overflow-scrolling:touch;
+  background:rgba(16,18,24,.985);backdrop-filter:blur(18px);-webkit-backdrop-filter:blur(18px);
+  border:1px solid rgba(255,255,255,.12);box-shadow:0 12px 40px rgba(0,0,0,.55)}
+/* 宽屏时收成靠右的小面板，不再横贯整个画面 */
+@media(min-width:560px){#tsheet{left:auto;right:14px;width:352px}}
+#tsheet.on{display:flex}
+.tsrow{display:flex;align-items:center;gap:7px;flex-wrap:wrap}
+.tsrow .tslab{color:rgba(255,255,255,.55);font-size:11.5px;min-width:30px}
+.tsbtn{background:rgba(255,255,255,.09);border:1px solid rgba(255,255,255,.14);
+  color:#fff;font-size:12.5px;padding:7px 12px;border-radius:9px;cursor:pointer;
+  line-height:1.2;white-space:nowrap}
+.tsbtn:active{transform:scale(.95)}
+.tsbtn.on{background:var(--grad);border-color:transparent;font-weight:600}
+.tsinfo{color:rgba(255,255,255,.45);font-size:11px;line-height:1.55;
+  word-break:break-all;white-space:pre-line;flex:1;min-width:0}
+#tsheet .tsclose{align-self:flex-end;background:none;border:none;color:rgba(255,255,255,.6);
+  font-size:13px;padding:2px 4px;cursor:pointer}
 #tprog{position:relative;flex:1;height:18px;display:flex;align-items:center;cursor:pointer;touch-action:none}
 #tprog::before{content:"";position:absolute;left:0;right:0;height:4px;border-radius:2px;
   background:rgba(255,255,255,.26)}
@@ -1535,10 +1891,34 @@ button.tag{font-family:inherit;cursor:pointer;color:var(--text)}
 .dbanner{aspect-ratio:16/9;border-radius:12px;overflow:hidden;background:var(--thumb-bg);
   position:relative;flex:0 0 auto}
 .dbanner img{position:absolute;inset:0;width:100%;height:100%;object-fit:cover;display:block}
-/* ---- 新增：继续观看横滑行 ---- */
+/* ---- 播放记录横滑行 ---- */
 .crow{display:flex;gap:14px;overflow-x:auto;padding:2px 2px 12px;scrollbar-width:thin;
   grid-column:1/-1;scroll-snap-type:x proximity}
 .crow .card{flex:0 0 165px;scroll-snap-align:start}
+/* ---- 播放记录页面：列表行（比横滑卡片能容纳更多信息） ---- */
+.hist-list{display:flex;flex-direction:column;gap:10px;grid-column:1/-1}
+.hist-row{display:flex;align-items:center;gap:13px;padding:10px;border-radius:14px;
+  background:var(--card);border:1px solid var(--line);cursor:pointer;transition:.15s;position:relative}
+.hist-row:hover{border-color:var(--line2);background:var(--panel)}
+.hist-thumb{flex:0 0 116px;aspect-ratio:16/9;border-radius:10px;overflow:hidden;position:relative;
+  background:var(--thumb-bg);display:flex;align-items:center;justify-content:center;font-size:20px}
+.hist-thumb img{position:absolute;inset:0;width:100%;height:100%;object-fit:cover;display:block}
+.hist-info{flex:1;min-width:0;display:flex;flex-direction:column;gap:5px}
+.hist-title{font-size:14px;font-weight:500;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;
+  padding-right:26px}
+.hist-meta{font-size:12px;color:var(--dim);overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.hist-bar{height:3px;border-radius:2px;background:rgba(255,255,255,.12);overflow:hidden}
+.hist-bar i{display:block;height:100%;background:var(--acc);border-radius:2px}
+.hist-left{font-size:11.5px;color:var(--dim)}
+.hist-del{position:absolute;top:8px;right:8px;width:26px;height:26px;border-radius:50%;
+  border:1px solid var(--line2);background:var(--panel);color:var(--dim);font-size:12px;
+  cursor:pointer;display:flex;align-items:center;justify-content:center;padding:0;transition:.15s}
+.hist-del:hover{color:#fff;background:#e5484d;border-color:#e5484d}
+.hist-more{grid-column:1/-1;font-size:12.5px;color:var(--dim);text-align:center;padding:16px 0 4px}
+@media(max-width:520px){
+  .hist-thumb{flex:0 0 92px}
+  .hist-title{font-size:13.5px}
+}
 /* ---- 新增：批量管理 ---- */
 .card .selbox{position:absolute;top:8px;left:8px;z-index:4;width:24px;height:24px;border-radius:50%;
   border:2px solid rgba(255,255,255,.85);background:rgba(5,7,10,.4);display:none;
@@ -1564,7 +1944,7 @@ body.managing .card.sel{outline:2px solid var(--acc);outline-offset:-2px}
   <div class="hrow">
     <div class="brand" id="brandHome" title="回到首页">
       <div class="logo"><svg viewBox="0 0 24 24" aria-hidden="true"><path fill="#fff" d="M18 4l2 4h-3l-2-4h-2l2 4h-3l-2-4H8l2 4H7L5 4H4c-1.1 0-2 .9-2 2v12c0 1.1.9 2 2 2h16c1.1 0 2-.9 2-2V4h-4z"/></svg></div>
-      <div><h1>局域网视频站<small>LAN VIDEO · v1.2.0</small></h1></div>
+      <div><h1>局域网视频站<small>LAN VIDEO · v__VER__</small></h1></div>
     </div>
     <input id="search" type="search" placeholder="搜索视频…" autocomplete="off">
     <button id="themeBtn" title="切换白天/黑夜模式">☀️</button>
@@ -1592,11 +1972,21 @@ body.managing .card.sel{outline:2px solid var(--acc);outline-offset:-2px}
       <button id="back" title="返回">←</button>
       <video id="v" controls playsinline webkit-playsinline preload="auto"></video>
       <div id="tbar">
+        <button id="tprev" type="button" title="上一集" style="display:none">⏮</button>
         <button id="tplay" type="button"></button>
+        <button id="tnext" type="button" title="下一集" style="display:none">⏭</button>
         <div id="tprog"><div id="tbuf"></div><div id="tfill"></div></div>
         <span id="ttime"></span>
         <button id="tfs" type="button">⛶</button>
       </div>
+      <button id="tset" type="button" title="播放设置" aria-label="播放设置">
+        <svg viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="currentColor"
+             stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+          <circle cx="12" cy="12" r="3.2"></circle>
+          <path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 1 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 1 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06A1.65 1.65 0 0 0 9 4.6a1.65 1.65 0 0 0 1-1.51V3a2 2 0 1 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 1 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z"></path>
+        </svg>
+      </button>
+      <div id="tsheet"></div>
     </div>
     <div class="pbody">
       <div class="pfolder" id="pfolder"></div>
@@ -1608,8 +1998,6 @@ body.managing .card.sel{outline:2px solid var(--acc);outline-offset:-2px}
         <button id="favBtn">收藏</button>
         <button id="dlBtn">下载</button>
       </div>
-      <div class="pact2" id="prow1"></div>
-      <div class="pact2" id="practiceRow" style="display:none"></div>
       <div class="moreh" id="moreh" style="display:none"></div>
       <div class="grid" id="more" style="display:none"></div>
     </div>
@@ -1667,7 +2055,23 @@ let lastInfo = null;          // 当前视频的 /api/info 结果
 let qualityPref = "orig";     // 画质偏好：orig / 1080 / 720
 let forceStartAt = -1;        // 指定起播位置（画质切换用，用完即清）
 let curSpeed = 1;             // 倍速（会话内保持；写入 defaultPlaybackRate，重启视频流不丢）
+try{
+  const s0 = parseFloat(localStorage.getItem("lan_video_speed"));
+  if([0.5, 1, 1.25, 1.5, 2].includes(s0)) curSpeed = s0;   // 倍速也记住，下次打开还是上次的
+}catch(e){}
+let autoNext = true;          // 自动连播：播完接同文件夹下一个（电视剧/教程场景）
+try{ autoNext = localStorage.getItem("lan_video_autonext") !== "0"; }catch(e){}
+let folderList = null;        // 当前视频所在文件夹的播放列表（上一集/下一集/连播用）
+let subOffset = 0;            // 字幕延迟（秒），每个视频重置
+let bright = 1;               // 手势调的亮度（CSS filter），每个视频重置
+let hudLast = 0;              // 音量/亮度 HUD 节流
+function hud(msg){
+  const n = Date.now();
+  if(n - hudLast < 90) return;
+  hudLast = n; toast(msg);
+}
 let abA = -1, abB = -1;       // A-B 循环点（练习模式）
+let practiceOn = false;       // 练习面板是否展开
 let manageMode = false;       // 批量管理模式
 const manageSel = new Set();
 let lastPostAt = 0;           // 上次向服务器同步进度的时间
@@ -1699,11 +2103,31 @@ function fmtDate(ts){
 function getProgress(){ try{ return JSON.parse(localStorage.getItem(LS_KEY)||"{}"); }catch(e){ return {}; } }
 function setProgress(p){ try{ localStorage.setItem(LS_KEY, JSON.stringify(p)); }catch(e){} }
 
+/* 清空播放记录：服务器 progress.json + 本地 localStorage 一起清 */
+async function clearHistory(){
+  const p = getProgress();
+  const keys = Object.keys(p);
+  if(!keys.length){ toast("没有播放记录"); return; }
+  if(!confirm("清空全部 " + keys.length + " 条播放记录？")) return;
+  setProgress({});
+  srvProg = {};
+  for(const k of keys) postProgress(k, 0, 0);
+  try{
+    const r = await fetch("/api/progress/clear", {method:"POST"});
+    const d = await r.json();
+    if(d.ok) toast("已清空播放记录");
+  }catch(e){ toast("已清空本地记录"); }
+  if(location.hash === "#/history") openHistory();
+  else if(lastListData) renderBrowse(lastListData);
+}
+
 /* ---------------- 观看进度跨设备同步（服务器 progress.json + 本地 localStorage 合并） ---------------- */
 let srvProg = {};
-function postProgress(path, t, d, keepalive){
+function postProgress(path, t, d, keepalive, w){
+  const payload = {path, t, d};
+  if(w !== undefined) payload.w = w;
   fetch("/api/progress", {method:"POST", headers:{"Content-Type":"application/json"},
-    body: JSON.stringify({path, t, d}), keepalive: !!keepalive}).catch(()=>{});
+    body: JSON.stringify(payload), keepalive: !!keepalive}).catch(()=>{});
 }
 const progReady = (async ()=>{
   try{
@@ -1714,11 +2138,13 @@ const progReady = (async ()=>{
     const p = getProgress();
     for(const k in srvProg){
       const s = srvProg[k], l = p[k];
-      if(!l || (l.u||0) < (s.u||0)) p[k] = {t:s.t, d:s.d, u:s.u};   // 服务器更新 → 拉下来
+      if(!l || (l.u||0) < (s.u||0)) p[k] = {t:s.t, d:s.d, u:s.u, w:s.w};   // 服务器更新 → 拉下来
     }
+    // 服务器判定已失效（源文件被删/移走）的记录，本地也一并清掉，避免首页出现打不开的空卡片
+    (d.gone || []).forEach(k=>{ delete p[k]; delete srvProg[k]; });
     for(const k in p){
       const l = p[k], s = srvProg[k];
-      if(l && l.u && (!s || (s.u||0) < l.u)) postProgress(k, l.t, l.d, true);   // 本地更新 → 推上去
+      if(l && l.u && (!s || (s.u||0) < l.u)) postProgress(k, l.t, l.d, true, l.w);   // 本地更新 → 推上去
     }
     setProgress(p);
   }catch(e){}
@@ -1940,9 +2366,11 @@ function videoCard(item){
   const t = document.createElement("div"); t.className = "title"; t.title = item.name;
   t.textContent = item.display || item.name;
   const meta = document.createElement("div"); meta.className = "meta";
-  meta.append(Object.assign(document.createElement("span"), {textContent: fmtSize(item.size)}),
-              Object.assign(document.createElement("span"), {textContent: fmtDate(item.mtime)}));
-  if(pct > 1) meta.append(Object.assign(document.createElement("span"),
+  if(item.size) meta.append(Object.assign(document.createElement("span"), {textContent: fmtSize(item.size)}));
+  if(item.mtime) meta.append(Object.assign(document.createElement("span"), {textContent: fmtDate(item.mtime)}));
+  if(prog && prog.w === 1) meta.append(Object.assign(document.createElement("span"),
+              {className: "seen", textContent: "✓ 已看"}));
+  else if(pct > 1) meta.append(Object.assign(document.createElement("span"),
               {className: "seen", textContent: "看过 " + Math.round(pct) + "%"}));
   info.append(t, meta);
   card.appendChild(info);
@@ -2096,10 +2524,21 @@ function renderCrumb(dir){
   });
 }
 
-function wideSection(title, sub){
+function wideSection(title, sub, href){
   const s = document.createElement("div");
   s.className = "sec wide";
-  s.innerHTML = `<h2>${title}</h2><span>${sub}</span>`;
+  const h = document.createElement("h2");
+  h.textContent = title;
+  if(href){        // 带链接的标题：点标题进入独立页面（如「▶ 播放记录」）
+    h.classList.add("seclink");
+    h.tabIndex = 0;
+    h.title = "查看全部";
+    const go = ()=>{ location.hash = href; };
+    h.addEventListener("click", go);
+    h.addEventListener("keydown", e=>{ if(e.key === "Enter" || e.key === " ") { e.preventDefault(); go(); } });
+  }
+  const sp = document.createElement("span"); sp.textContent = sub;
+  s.append(h, sp);
   return s;
 }
 
@@ -2147,7 +2586,7 @@ async function renderBrowse(data){
     return;
   }
 
-  if(isRoot){   // 首页顶部：收藏夹区 + 继续观看
+  if(isRoot){   // 首页顶部：收藏夹区 + 播放记录
     try{
       const fr = await fetch("/api/favs");
       const fd = await fr.json();
@@ -2165,13 +2604,18 @@ async function renderBrowse(data){
         mtime: (srvProg[k] && srvProg[k].mtime) || 0,
         u: x.u || 0,
       }))
-      .sort((a, b)=>b.u - a.u)
-      .slice(0, 12);
+      .sort((a, b)=>b.u - a.u);
     if(cont.length){
-      grid.appendChild(wideSection("▶ 继续观看", "上次没看完的"));
+      // 首页只放最近 12 条，点标题进「播放记录」页看全部
+      const sec = wideSection("▶ 播放记录", cont.length + " 条", "#/history");
+      const clr = document.createElement("button");
+      clr.className = "upbtn"; clr.textContent = "清空记录";
+      clr.addEventListener("click", ()=>clearHistory());
+      sec.appendChild(clr);
+      grid.appendChild(sec);
       const row = document.createElement("div");
       row.className = "crow";
-      cont.forEach(x=>row.appendChild(videoCard(x)));
+      cont.slice(0, 12).forEach(x=>row.appendChild(videoCard(x)));
       grid.appendChild(row);
     }
   }
@@ -2185,11 +2629,11 @@ async function renderBrowse(data){
     const sec = wideSection("视频", data.videos.length + " 个");
     if(!isRoot){
       const up = document.createElement("button");
-      up.className = "upbtn"; up.textContent = "⬆ 上传视频到这里";
+      up.className = "upbtn"; up.textContent = "⬆ 上传视频";
       up.addEventListener("click", ()=>pickUpload(data.cur));
       sec.appendChild(up);
       const mg = document.createElement("button");
-      mg.className = "upbtn"; mg.textContent = manageMode ? "✕ 退出管理" : "✓ 管理";
+      mg.className = "upbtn"; mg.textContent = manageMode ? "退出管理" : "管理";
       mg.addEventListener("click", ()=>{ toggleManage(); renderBrowse(lastListData); });
       sec.appendChild(mg);
     }
@@ -2204,7 +2648,7 @@ async function renderBrowse(data){
       : "这个文件夹里没有视频";
     if(!isRoot){
       const up = document.createElement("button");
-      up.className = "upbtn"; up.textContent = "⬆ 上传视频到这里";
+      up.className = "upbtn"; up.textContent = "⬆ 上传视频";
       up.addEventListener("click", ()=>pickUpload(data.cur));
       box.appendChild(document.createElement("br"));
       box.appendChild(up);
@@ -2268,7 +2712,7 @@ let navSeq = 0;   // 渲染序号：慢的旧响应不覆盖新的（搜索/切�
 
 async function openDir(dir){
   const seq = ++navSeq;
-  await progReady;             // 首次进入先把服务器进度合入本地（卡片进度条/继续观看用）
+  await progReady;             // 首次进入先把服务器进度合入本地（卡片进度条/播放记录用）
   $("#emptybox").innerHTML = "";
   $("#emptybox").className = "loading";
   $("#emptybox").textContent = "加载中…";
@@ -2299,6 +2743,134 @@ function addFavCard(){
   card.innerHTML = "<div class='plus'>＋</div><div>新建收藏夹</div>";
   card.addEventListener("click", newFavFolderDialog);
   return card;
+}
+
+/* ---------------- 播放记录页面 ----------------
+   首页只展示最近 12 条；点「▶ 播放记录」标题进入本页，默认展示最近 100 条。
+   注意 100 只是本页的显示上限，progress.json 里仍保留全部记录（服务端上限 2000 条）。 */
+const HISTORY_PAGE_LIMIT = 100;
+
+function historyItems(){
+  return Object.entries(getProgress())
+    .filter(([k, x])=>x && x.d && (x.w === 1 || (x.t > 10 && x.t < x.d*0.95)))
+    .map(([k, x])=>({
+      path: k,
+      name: (srvProg[k] && srvProg[k].name) || k.split("/").pop(),
+      size: (srvProg[k] && srvProg[k].size) || 0,
+      mtime: (srvProg[k] && srvProg[k].mtime) || 0,
+      u: x.u || 0,
+      t: x.t || 0,
+      d: x.d || 0,
+      w: x.w || 0,
+    }))
+    .sort((a, b)=>b.u - a.u);
+}
+
+async function openHistory(){
+  const seq = ++navSeq;        // 与 openDir 共用序号：后发起的导航覆盖先发起的
+  await progReady;             // 先把服务器记录合入本地，否则刚打开页面会读到空 localStorage
+  if(seq !== navSeq) return;   // 期间又导航了，丢弃
+  $("#results").style.display = "none";
+  $("#browse").style.display = "";
+  const crumb = $("#crumb"); crumb.innerHTML = "";
+  const root = document.createElement("a");
+  root.href = "#/d/"; root.innerHTML = ICON_CLAP + '<span style="margin-left:5px">全部</span>'; crumb.appendChild(root);
+  crumb.append(" ");
+  const here = document.createElement("b"); here.textContent = "▶ 播放记录";
+  crumb.appendChild(here);
+
+  const grid = $("#grid"); grid.innerHTML = "";
+  const box = $("#emptybox"); box.innerHTML = "";
+  grid.className = "grid";
+  grid.style.gridTemplateColumns = "";
+  const all = historyItems();
+  const shown = all.slice(0, HISTORY_PAGE_LIMIT);
+
+  const sec = wideSection("▶ 播放记录",
+    all.length > shown.length ? shown.length + " / " + all.length + " 条" : all.length + " 条");
+  const clr = document.createElement("button");
+  clr.className = "upbtn"; clr.textContent = "清空记录";
+  clr.addEventListener("click", async ()=>{ await clearHistory(); openHistory(); });
+  sec.appendChild(clr);
+  grid.appendChild(sec);
+
+  if(!shown.length){
+    box.className = "empty";
+    box.innerHTML = "还没有播放记录<br>看过一部分（超过 10 秒且未看完）的视频会出现在这里";
+    return;
+  }
+  const wrap = document.createElement("div");
+  wrap.className = "hist-list";
+  shown.forEach(x=>wrap.appendChild(historyRow(x)));
+  grid.appendChild(wrap);
+
+  if(all.length > shown.length){
+    const more = document.createElement("div");
+    more.className = "hist-more";
+    more.textContent = "本页最多显示 " + HISTORY_PAGE_LIMIT + " 条，还有 "
+      + (all.length - shown.length) + " 条更早的记录未显示";
+    grid.appendChild(more);
+  }
+}
+
+function historyRow(x){
+  const row = document.createElement("div");
+  row.className = "hist-row";
+  row.addEventListener("click", ()=>{ location.hash = "#/p/" + encodeURIComponent(x.path); });
+
+  const thumb = document.createElement("div");
+  thumb.className = "hist-thumb";
+  const img = document.createElement("img");
+  img.loading = "lazy"; img.alt = "";
+  img.src = "/thumb?path=" + encodeURIComponent(x.path)
+    + (x.mtime ? "&v=" + x.mtime : "");
+  img.onerror = ()=>{ thumb.textContent = "🎞️"; };
+  thumb.appendChild(img);
+  row.appendChild(thumb);
+
+  const info = document.createElement("div");
+  info.className = "hist-info";
+  const t = document.createElement("div");
+  t.className = "hist-title"; t.textContent = x.name; t.title = x.path;
+  info.appendChild(t);
+
+  const meta = document.createElement("div");
+  meta.className = "hist-meta";
+  const bits = [];
+  if(x.d) bits.push(fmtTime(x.d));
+  if(x.w === 1) bits.push("✓ 已看");
+  if(x.u) bits.push(fmtDate(x.u) + " 看过");
+  if(x.size) bits.push(fmtSize(x.size));
+  meta.textContent = bits.join(" · ");
+  info.appendChild(meta);
+
+  if(x.d > 0){
+    const pct = Math.min(100, x.t / x.d * 100);
+    const bar = document.createElement("div");
+    bar.className = "hist-bar";
+    const fill = document.createElement("i");
+    fill.style.width = pct.toFixed(1) + "%";
+    bar.appendChild(fill);
+    info.appendChild(bar);
+    const left = document.createElement("div");
+    left.className = "hist-left";
+    left.textContent = "看到 " + fmtTime(x.t) + " / 共 " + fmtTime(x.d);
+    info.appendChild(left);
+  }
+  row.appendChild(info);
+
+  const del = document.createElement("button");
+  del.className = "hist-del"; del.textContent = "✕"; del.title = "从记录中移除";
+  del.addEventListener("click", e=>{
+    e.stopPropagation();
+    const p = getProgress(); delete p[x.path]; setProgress(p);
+    delete srvProg[x.path];
+    postProgress(x.path, 0, 0);
+    row.remove();
+    toast("已从播放记录移除");
+  });
+  row.appendChild(del);
+  return row;
 }
 
 async function openFavHome(){
@@ -2466,9 +3038,12 @@ function saveCurProgress(){
   const t = vTime(), d = vDur();
   if(curItem && d && t > 5 && t < d*0.95){
     const p = getProgress();
-    p[curItem.path] = {t, d, u: Math.floor(Date.now()/1000)};
+    const old = p[curItem.path] || {};
+    const ent = {t, d, u: Math.floor(Date.now()/1000)};
+    if(old.w) ent.w = 1;                // 重温中：保留已看标记
+    p[curItem.path] = ent;
     setProgress(p);
-    postProgress(curItem.path, t, d);   // 换视频/关播放器时同步到服务器
+    postProgress(curItem.path, t, d, false, ent.w);   // 换视频/关播放器时同步到服务器
   }
 }
 
@@ -2477,6 +3052,39 @@ function transSrcFor(path, t, extra){
   if(qualityPref !== "orig") u += "&q=" + qualityPref;
   if(extra) u += extra;
   return u;
+}
+
+/* ---------------- 播放列表（同文件夹连播） ----------------
+   打开播放页时异步拉所在文件夹的视频清单，供 ⏮ 上一集 / ⏭ 下一集 / 自动连播使用。
+   直连模式和转码模式都有（设置面板里的连播行）；⏮⏭ 按钮只在转码流的 tbar 上显示。 */
+async function loadFolderList(folder, forPath){
+  folderList = null;
+  paintPrevNext();
+  if(folder == null) return;
+  try{
+    const r = await fetch("/api/list?dir=" + encodeURIComponent(folder || ""));
+    const d = await r.json();
+    if(!curItem || curItem.path !== forPath) return;   // 期间已切视频，丢弃
+    folderList = {dir: folder || "", vids: sortVideos(d.videos || [])};
+  }catch(e){ return; }
+  paintPrevNext();
+}
+function paintPrevNext(){
+  const pv = $("#tprev"), nx = $("#tnext");
+  if(!pv || !nx) return;
+  let i = -1;
+  if(folderList && curItem) i = folderList.vids.findIndex(x=>x.path === curItem.path);
+  pv.style.display = i > 0 ? "" : "none";
+  nx.style.display = (i >= 0 && i < folderList.vids.length - 1) ? "" : "none";
+}
+function jumpEpisode(step){
+  if(!folderList || !curItem) { toast("当前视频不在播放列表里"); return; }
+  const i = folderList.vids.findIndex(x=>x.path === curItem.path);
+  const j = i + step;
+  if(i < 0 || j < 0 || j >= folderList.vids.length){ toast(step > 0 ? "已经是最后一个了" : "已经是第一个了"); return; }
+  toast((step > 0 ? "下一集：" : "上一集：") + folderList.vids[j].name);
+  // 走 hash 导航：refreshRoute 统一负责关旧开新，地址栏/后退键也保持一致
+  location.hash = "#/p/" + encodeURIComponent(folderList.vids[j].path);
 }
 
 function openPlayerByPath(path){
@@ -2490,12 +3098,16 @@ function openPlayerByPath(path){
   stopTbar();
   v.controls = true;
   v.classList.remove("mirror");           // 镜像/字幕轨/练习循环每个视频重新开始
+  v.style.filter = "";                    // 手势亮度也重置
+  bright = 1; subOffset = 0;
   v.querySelectorAll("track").forEach(t=>t.remove());
   abA = abB = -1;
-  $("#practiceRow").style.display = "none";
+  practiceOn = false;
+  $("#tsheet").classList.remove("on");
   v.playbackRate = curSpeed; v.defaultPlaybackRate = curSpeed;   // 倍速跨视频保持
   const folder = item.folder !== undefined ? item.folder
                  : path.split("/").slice(0, -1).join("/");
+  loadFolderList(folder, path);           // 同文件夹清单：上一集/下一集/自动连播用
 
   $("#pfolder").innerHTML = "📁 ";
   const fl = document.createElement("a");
@@ -2520,7 +3132,7 @@ function openPlayerByPath(path){
   document.body.style.overflow = "hidden";
   forceExpandVwrap();
   $("#pscroll").scrollTop = 0;
-  buildPlayerRows(); paintPractice();
+  buildPlayerRows();
   setupMediaSession(item, folder);
 
   v.onerror = ()=>{
@@ -2595,6 +3207,7 @@ function openPlayerByPath(path){
     thumbPaused = true;          // 播放优先：缩略图生成让出磁盘带宽
     forceExpandVwrap();          // 播放中视频区必须可见：无条件展开，不搞动画
     $("#player").classList.add("playing");
+    chromeWake();                // 开始播放：2.5 秒后自动隐藏 ← 与 ⚙
     updatePausedView();
   };
   v.onpause = ()=>{
@@ -2602,6 +3215,7 @@ function openPlayerByPath(path){
     if(curItem){ const t = vTime(), d = vDur(); if(d) postProgress(curItem.path, t, d); }
     thumbPaused = false;
     pumpThumbs();
+    chromeStop();                // 暂停：按钮常显，方便返回
     $("#player").classList.remove("playing");   // 暂停后取消吸顶，下滑可收起视频区
     updatePausedView();
   };
@@ -2609,8 +3223,26 @@ function openPlayerByPath(path){
     if(!curItem) return;
     thumbPaused = false;
     pumpThumbs();
-    const p = getProgress(); delete p[curItem.path]; setProgress(p);
-    postProgress(curItem.path, 0, 0);   // 看完：服务器也清除记录
+    const d = vDur() || 0;
+    const p = getProgress();
+    const ent = p[curItem.path] || {};
+    ent.t = d; if(d) ent.d = d;
+    ent.u = Math.floor(Date.now()/1000); ent.w = 1;   // 播完 → 标记已看（不再清记录）
+    p[curItem.path] = ent; setProgress(p);
+    postProgress(curItem.path, d, d);                 // 服务器同样记为已看
+    if(autoNext && folderList){                       // 自动连播：1.2 秒后接同文件夹下一个
+      const i = folderList.vids.findIndex(x=>x.path === curItem.path);
+      if(i >= 0 && i < folderList.vids.length - 1){
+        const endedPath = curItem.path;
+        const nxt = folderList.vids[i + 1];
+        toast("即将播放：" + nxt.name);
+        setTimeout(()=>{   // 走 hash 导航，refreshRoute 统一关旧开新
+          if(curItem && curItem.path === endedPath)
+            location.hash = "#/p/" + encodeURIComponent(nxt.path);
+        }, 1200);
+        return;
+      }
+    }
   };
   // 问服务器播放方式：direct=原生直读；cached=已有转码缓存当普通文件播；否则实时转码直推
   fetch("/api/info?path=" + encodeURIComponent(path)).then(r=>r.json()).then(d=>{
@@ -2661,62 +3293,229 @@ function openPlayerByPath(path){
   refreshFavState();
 }
 
-/* ---------------- 播放页功能行：倍速 / 画质 / 字幕 / 截图 / 练习 ---------------- */
+/* ---------------- 播放设置面板：倍速 / 画质 / 字幕 / 截图 / 练习 ---------------- */
 function chipBtn(txt){
   const b = document.createElement("button");
   b.className = "tag act"; b.type = "button"; b.textContent = txt;
   return b;
 }
-function buildPlayerRows(){
-  const row = $("#prow1");
-  if(!row) return;
-  row.innerHTML = "";
-  [0.5, 1, 1.25, 1.5, 2].forEach(r=>{
-    const b = chipBtn(r === 1 ? "1x" : r + "x");
-    if(curSpeed === r) b.classList.add("on");
-    b.addEventListener("click", ()=>{
-      curSpeed = r;
-      const v = $("#v");
-      v.playbackRate = r; v.defaultPlaybackRate = r;   // default 值让转码重启后仍保持倍速
-      buildPlayerRows();
-    });
-    row.appendChild(b);
-  });
-  if(!lastInfo || lastInfo.ffmpeg){   // 有 ffmpeg 才能实时转码出低画质
-    const lab = document.createElement("span");
-    lab.className = "rlab"; lab.textContent = "画质";
-    row.appendChild(lab);
-    [["orig","原画"],["1080","1080P"],["720","720P"]].forEach(([q, label])=>{
-      const b = chipBtn(label);
-      if(qualityPref === q) b.classList.add("on");
-      b.addEventListener("click", ()=>setQuality(q));
-      row.appendChild(b);
-    });
+function tsBtn(txt, on){
+  const b = document.createElement("button");
+  b.className = "tsbtn" + (on ? " on" : ""); b.type = "button"; b.textContent = txt;
+  return b;
+}
+function tsRow(label){
+  const r = document.createElement("div"); r.className = "tsrow";
+  if(label){
+    const s = document.createElement("span"); s.className = "tslab"; s.textContent = label;
+    r.appendChild(s);
   }
+  return r;
+}
+
+function setSpeed(r){
+  curSpeed = r;
+  const v = $("#v");
+  v.playbackRate = r; v.defaultPlaybackRate = r;   // default 值让转码重启后仍保持倍速
+  try{ localStorage.setItem("lan_video_speed", String(r)); }catch(e){}
+}
+function buildPlayerRows(){
+  const sheet = $("#tsheet");
+  if(!sheet) return;
+  const wasOpen = sheet.classList.contains("on");
+  sheet.innerHTML = "";
+
+  // 倍速
+  const r1 = tsRow("倍速");
+  [0.5, 1, 1.25, 1.5, 2].forEach(r=>{
+    const b = tsBtn(r === 1 ? "1x" : r + "x", curSpeed === r);
+    b.addEventListener("click", ()=>{
+      setSpeed(r);
+      buildPlayerRows();
+      sheet.classList.add("on");
+    });
+    r1.appendChild(b);
+  });
+  sheet.appendChild(r1);
+
+  // 连播（所在文件夹有多个视频才显示）
+  if(folderList && folderList.vids.length > 1){
+    const rc = tsRow("连播");
+    const b1 = tsBtn("自动连播 " + (autoNext ? "开" : "关"), autoNext);
+    b1.addEventListener("click", ()=>{
+      autoNext = !autoNext;
+      try{ localStorage.setItem("lan_video_autonext", autoNext ? "1" : "0"); }catch(e){}
+      toast(autoNext ? "播完自动接下一个" : "已关闭自动连播");
+      buildPlayerRows();
+      sheet.classList.add("on");
+    });
+    rc.appendChild(b1);
+    const b2 = tsBtn("⏮ 上一集");
+    b2.addEventListener("click", ()=>jumpEpisode(-1));
+    rc.appendChild(b2);
+    const b3 = tsBtn("下一集 ⏭");
+    b3.addEventListener("click", ()=>jumpEpisode(1));
+    rc.appendChild(b3);
+    sheet.appendChild(rc);
+  }
+
+  // 画质（有 ffmpeg 才能实时转码出低画质）
+  if(!lastInfo || lastInfo.ffmpeg){
+    const r2 = tsRow("画质");
+    [["orig","原画"],["1080","1080P"],["720","720P"]].forEach(([q, label])=>{
+      const b = tsBtn(label, qualityPref === q);
+      b.addEventListener("click", ()=>setQuality(q));
+      r2.appendChild(b);
+    });
+    sheet.appendChild(r2);
+  }
+
+  // 字幕（有 track 才显示）：开关 + 延迟微调
   const v = $("#v");
   if(v.textTracks && v.textTracks.length){
+    const r3 = tsRow("字幕");
     const tt = v.textTracks[0];
-    const b = chipBtn(tt.mode === "showing" ? "字幕 开" : "字幕 关");
-    if(tt.mode === "showing") b.classList.add("on");
+    const b = tsBtn(tt.mode === "showing" ? "开" : "关", tt.mode === "showing");
     b.addEventListener("click", ()=>{
       const t0 = $("#v").textTracks[0];
       if(t0) t0.mode = t0.mode === "showing" ? "disabled" : "showing";
       buildPlayerRows();
+      sheet.classList.add("on");
     });
-    row.appendChild(b);
+    r3.appendChild(b);
+    const bm = tsBtn("-0.5s");
+    bm.addEventListener("click", ()=>nudgeSub(-0.5));
+    r3.appendChild(bm);
+    const bp = tsBtn("+0.5s");
+    bp.addEventListener("click", ()=>nudgeSub(0.5));
+    r3.appendChild(bp);
+    if(subOffset) r3.appendChild(Object.assign(document.createElement("span"),
+        {className: "tslab", textContent: "偏移 " + (subOffset > 0 ? "+" : "") + subOffset.toFixed(1) + "s"}));
+    sheet.appendChild(r3);
   }
-  const shot = chipBtn("📸 截图");
-  shot.addEventListener("click", shootFrame);
-  row.appendChild(shot);
-  const prac = chipBtn("🎯 练习");
-  if($("#practiceRow").style.display !== "none") prac.classList.add("on");
+
+  // 工具：截图 / 练习 / 已看
+  const r4 = tsRow("工具");
+  const shot = tsBtn("📸 截图");
+  shot.addEventListener("click", ()=>{ shootFrame(); });
+  r4.appendChild(shot);
+  const prac = tsBtn("🎯 练习", practiceOn);
   prac.addEventListener("click", ()=>{
-    const pr = $("#practiceRow");
-    pr.style.display = pr.style.display === "none" ? "" : "none";
-    paintPractice();
+    practiceOn = !practiceOn;
+    renderPractice();
     buildPlayerRows();
+    sheet.classList.add("on");
   });
-  row.appendChild(prac);
+  r4.appendChild(prac);
+  const prog0 = curItem ? (getProgress()[curItem.path] || {}) : {};
+  const wat = tsBtn("✓ 已看", prog0.w === 1);
+  wat.addEventListener("click", ()=>{
+    if(!curItem) return;
+    const p = getProgress();
+    const ent = p[curItem.path] || {};
+    const wasW = ent.w === 1;
+    if(wasW){
+      delete ent.w;
+      if(!ent.d || ent.t < 5 || ent.t >= ent.d * 0.95) delete p[curItem.path];
+      else { ent.u = Math.floor(Date.now()/1000); p[curItem.path] = ent; }
+    }else{
+      ent.w = 1;
+      ent.d = ent.d || vDur() || 0;
+      ent.t = ent.t || ent.d;
+      ent.u = Math.floor(Date.now()/1000);
+      p[curItem.path] = ent;
+    }
+    setProgress(p);
+    postProgress(curItem.path, ent.t || 0, ent.d || 0, false, wasW ? 0 : 1);
+    toast(wasW ? "已取消已看标记" : "已标记为已看");
+    buildPlayerRows();
+    sheet.classList.add("on");
+  });
+  r4.appendChild(wat);
+  sheet.appendChild(r4);
+
+  // 练习面板（展开时才有内容）
+  if(practiceOn){
+    const r5 = tsRow("");
+    buildPracticeChips(r5);
+    sheet.appendChild(r5);
+  }
+
+  // 视频信息：分辨率/编码/大小/路径
+  const d0 = lastInfo || {};
+  const bits = [];
+  if(d0.res) bits.push(d0.res + (d0.fps ? "@" + (Math.abs(d0.fps - Math.round(d0.fps)) < 0.05 ? Math.round(d0.fps) : d0.fps.toFixed(2)) : ""));
+  if(d0.v && d0.v !== "?") bits.push(String(d0.v).toUpperCase());
+  if(d0.a && d0.a !== "?") bits.push(String(d0.a).toUpperCase());
+  if(d0.dur) bits.push(fmtTime(d0.dur));
+  if(d0.size) bits.push(fmtSize(d0.size));
+  const ri = tsRow("信息");
+  const iinfo = document.createElement("span");
+  iinfo.className = "tsinfo";
+  iinfo.textContent = (bits.join(" · ") || "—") + (curItem ? "\n" + curItem.path : "");
+  ri.appendChild(iinfo);
+  sheet.appendChild(ri);
+
+  const close = document.createElement("button");
+  close.className = "tsclose"; close.type = "button"; close.textContent = "收起";
+  close.addEventListener("click", ()=>sheet.classList.remove("on"));
+  sheet.appendChild(close);
+
+  if(wasOpen) sheet.classList.add("on");
+}
+
+/* 字幕整体延迟 ±delta：直接平移已加载 cue 的时间轴 */
+function nudgeSub(delta){
+  const v = $("#v");
+  const tt = v.textTracks && v.textTracks[0];
+  if(!tt){ toast("没有字幕轨"); return; }
+  const cues = tt.cues;
+  if(!cues || !cues.length){ toast("字幕还没加载好，稍后再试"); return; }
+  subOffset = Math.round((subOffset + delta) * 10) / 10;
+  for(const c of cues){
+    c.startTime = Math.max(0, c.startTime + delta);
+    c.endTime = Math.max(0.1, c.endTime + delta);
+  }
+  toast("字幕偏移 " + (subOffset > 0 ? "+" : "") + subOffset.toFixed(1) + " 秒");
+  buildPlayerRows();
+  $("#tsheet").classList.add("on");
+}
+
+/* 练习面板单独渲染（不依赖面板是否展开，保证 A/B 点状态即时刷新） */
+function renderPractice(){ buildPlayerRows(); }
+
+function buildPracticeChips(row){
+  const mk = (txt, fn, on)=>{
+    const b = tsBtn(txt, on);
+    b.addEventListener("click", fn);
+    row.appendChild(b);
+  };
+  mk("A " + (abA >= 0 ? fmtTime(abA) : "点"), ()=>{
+    abA = vTime(); toast("A 点 " + fmtTime(abA) + "（到 B 点后循环）"); buildPlayerRows();
+  }, abA >= 0);
+  mk("B " + (abB >= 0 ? fmtTime(abB) : "点"), ()=>{
+    abB = vTime();
+    if(abB <= abA) toast("B 点要晚于 A 点才生效");
+    else toast("A-B 循环：" + fmtTime(abA) + " ↔ " + fmtTime(abB));
+    buildPlayerRows();
+  }, abB > abA);
+  mk("清循环", ()=>{ abA = abB = -1; buildPlayerRows(); }, abA >= 0 || abB >= 0);
+  mk("⏴ 帧", ()=>{
+    const v = $("#v");
+    if(!v.paused) v.pause();
+    v.currentTime = Math.max(0, v.currentTime - 1/30);
+  });
+  mk("帧 ⏵", ()=>{
+    const v = $("#v");
+    if(!v.paused) v.pause();
+    v.currentTime = Math.min(vDur() || 36000, v.currentTime + 1/30);
+  });
+  mk("0.5x", ()=>{
+    setSpeed(0.5);
+    buildPlayerRows();
+  }, curSpeed === 0.5);
+  mk("🔁 镜像", ()=>{ $("#v").classList.toggle("mirror"); buildPlayerRows(); },
+     $("#v").classList.contains("mirror"));
 }
 
 function setQuality(q){
@@ -2780,46 +3579,6 @@ function shootFrame(){
   }catch(e){ toast("截图失败"); }
 }
 
-function paintPractice(){
-  const row = $("#practiceRow");
-  if(!row || row.style.display === "none") return;
-  row.innerHTML = "";
-  const mk = (txt, fn, on)=>{
-    const b = chipBtn(txt);
-    if(on) b.classList.add("on");
-    b.addEventListener("click", fn);
-    row.appendChild(b);
-  };
-  mk("A 点 " + (abA >= 0 ? fmtTime(abA) : ""), ()=>{
-    abA = vTime(); toast("A 点 " + fmtTime(abA) + "（到 B 点后循环）"); paintPractice();
-  }, abA >= 0);
-  mk("B 点 " + (abB >= 0 ? fmtTime(abB) : ""), ()=>{
-    abB = vTime();
-    if(abB <= abA) toast("B 点要晚于 A 点才生效");
-    else toast("A-B 循环：" + fmtTime(abA) + " ↔ " + fmtTime(abB));
-    paintPractice();
-  }, abB > abA);
-  mk("清循环", ()=>{ abA = abB = -1; paintPractice(); }, abA >= 0 || abB >= 0);
-  mk("⏴ 帧", ()=>{
-    const v = $("#v");
-    if(!v.paused) v.pause();
-    v.currentTime = Math.max(0, v.currentTime - 1/30);
-  });
-  mk("帧 ⏵", ()=>{
-    const v = $("#v");
-    if(!v.paused) v.pause();
-    v.currentTime = Math.min(vDur() || 36000, v.currentTime + 1/30);
-  });
-  mk("0.5x", ()=>{
-    curSpeed = 0.5;
-    const v = $("#v");
-    v.playbackRate = 0.5; v.defaultPlaybackRate = 0.5;
-    buildPlayerRows(); paintPractice();
-  }, curSpeed === 0.5);
-  mk("🔁 镜像", ()=>{ $("#v").classList.toggle("mirror"); paintPractice(); },
-     $("#v").classList.contains("mirror"));
-}
-
 /* ---------------- 锁屏/耳机控制（MediaSession） ---------------- */
 function setupMediaSession(item, folder){
   if(!("mediaSession" in navigator)) return;
@@ -2859,6 +3618,66 @@ async function loadMore(path, folder){
     others.forEach(x=> more.appendChild(videoCard(x)));
   }catch(e){ /* 忽略，更多列表只是锦上添花 */ }
 }
+
+/* ---------------- 播放器浮层自动隐藏：← 返回 与 ⚙ 播放设置 ----------------
+   两个按钮节奏分开：
+     ← 返回      2.5 秒淡出（保持原有节奏，退出播放页的动作需要留足反应时间）
+     ⚙ 播放设置  1.2 秒淡出（跟浏览器原生控件条同步，画面顶部不残留东西）
+   浏览器不暴露原生控件条的显隐状态，没法直接读；这里按"最后一次交互后
+   原生控件自动收起"的时机对齐——Chrome/Safari 移动端约 1~1.5 秒。
+   暂停、播完、打开设置面板时两个按钮都常显。 */
+const CHROME_BACK_MS = 2500;
+const CHROME_GEAR_MS = 1200;
+let backTimer = null, gearTimer = null;
+let backHidden = false, gearHidden = false, chromeLastWake = 0;
+
+function backShow(){
+  if(!backHidden) return;
+  backHidden = false;
+  document.querySelector(".vwrap").classList.remove("backhide");
+}
+function gearShow(){
+  if(!gearHidden) return;
+  gearHidden = false;
+  document.querySelector(".vwrap").classList.remove("gearhide");
+}
+function chromeShow(){ backShow(); gearShow(); }
+
+function backHide(){
+  const v = $("#v");
+  if(!curItem || v.paused || v.ended) return;
+  if($("#tsheet").classList.contains("on")) return;
+  backHidden = true;
+  document.querySelector(".vwrap").classList.add("backhide");
+}
+function gearHide(){
+  const v = $("#v");
+  if(!curItem || v.paused || v.ended) return;
+  if($("#tsheet").classList.contains("on")) return;
+  gearHidden = true;
+  document.querySelector(".vwrap").classList.add("gearhide");
+}
+function chromeWake(){
+  // pointermove 很密（拖动进度条时每帧都来），200ms 内不重复重置计时器
+  const now = Date.now();
+  if(now - chromeLastWake < 200 && !backHidden && !gearHidden) return;
+  chromeLastWake = now;
+  chromeShow();
+  clearTimeout(backTimer); clearTimeout(gearTimer);
+  backTimer = setTimeout(backHide, CHROME_BACK_MS);
+  gearTimer = setTimeout(gearHide, CHROME_GEAR_MS);
+}
+function chromeStop(){        // 暂停/退出播放：取消计时，按钮常显
+  clearTimeout(backTimer); clearTimeout(gearTimer);
+  backTimer = gearTimer = null;
+  chromeShow();
+}
+// 任何触摸/点击/鼠标移动/按键都把按钮叫回来，并重新开始倒计时
+["pointerdown","pointermove","keydown"].forEach(ev=>{
+  document.querySelector(".vwrap").addEventListener(ev, chromeWake, {passive:true});
+});
+document.addEventListener("mousemove", chromeWake, {passive:true});
+$("#tsheet").addEventListener("pointerdown", chromeShow, {passive:true});
 
 /* ---------------- 转码流的进度条（流式 duration 是 Infinity，系统进度条不可用） ---------------- */
 function startTbar(){
@@ -2907,6 +3726,23 @@ $("#tplay").addEventListener("click", ()=>{
   const v = $("#v");
   if(v.paused) v.play().catch(()=>{}); else v.pause();
 });
+$("#tset").addEventListener("click", (e)=>{
+  e.stopPropagation();
+  const sheet = $("#tsheet");
+  if(sheet.classList.contains("on")){ sheet.classList.remove("on"); chromeWake(); return; }
+  buildPlayerRows();
+  sheet.classList.add("on");
+  chromeShow();                 // 面板打开时按钮必须可见
+  clearTimeout(backTimer); clearTimeout(gearTimer);   // 面板开着不自动隐藏
+});
+// 点面板外任意处收起（面板内的点击不冒泡到这里）
+document.addEventListener("click", (e)=>{
+  const sheet = $("#tsheet");
+  if(!sheet || !sheet.classList.contains("on")) return;
+  if(sheet.contains(e.target) || e.target.closest("#tset")) return;
+  sheet.classList.remove("on");
+  chromeWake();                 // 面板收起后重新开始倒计时
+}, true);
 $("#tfs").addEventListener("click", ()=>{
   const v = $("#v");
   if(document.fullscreenElement){ document.exitFullscreen(); return; }
@@ -2920,7 +3756,8 @@ $("#tfs").addEventListener("click", ()=>{
   let downT = 0, downX = 0, downY = 0, moved = false;
   let longTimer = null, longFired = false;
   let lastTap = 0, lastTapX = 0;
-  const grab = e => e.target.closest && e.target.closest("#tbar,#back,button");
+  let swipeMode = null, volStart = 1, brightStart = 1;   // 垂直滑动手势：右半区音量 / 左半区亮度
+  const grab = e => e.target.closest && e.target.closest("#tbar,#tsheet,#tset,#back,button");
   const endHold = ()=>{
     clearTimeout(longTimer);
     const v = $("#v");
@@ -2934,7 +3771,7 @@ $("#tfs").addEventListener("click", ()=>{
   wrap.addEventListener("pointerdown", e=>{
     if(streamMode !== "trans" || !curItem || grab(e)) return;
     downT = Date.now(); downX = e.clientX; downY = e.clientY;
-    moved = false; longFired = false;
+    moved = false; longFired = false; swipeMode = null;
     clearTimeout(longTimer);
     longTimer = setTimeout(()=>{
       const v = $("#v");
@@ -2947,15 +3784,43 @@ $("#tfs").addEventListener("click", ()=>{
     }, 500);
   });
   wrap.addEventListener("pointermove", e=>{
+    if(downT && !swipeMode && Date.now() - downT > 140){
+      const dx = e.clientX - downX, dy = e.clientY - downY;
+      if(Math.abs(dy) > 28 && Math.abs(dy) > Math.abs(dx) * 1.3){
+        const rect = wrap.getBoundingClientRect();
+        const relX = (downX - rect.left) / rect.width;
+        swipeMode = relX >= 0.4 ? "vol" : "bright";   // 右侧调音量，左侧调亮度
+        volStart = $("#v").volume; brightStart = bright;
+        clearTimeout(longTimer);
+      }
+    }
+    if(swipeMode){
+      const dy = e.clientY - downY;
+      if(swipeMode === "vol"){
+        const nv = Math.min(1, Math.max(0, volStart - dy / 220));
+        const v0 = $("#v");
+        if(Math.abs(v0.volume - nv) > 0.004){ v0.volume = nv; v0.muted = false; }
+        hud("🔊 音量 " + Math.round(nv * 100) + "%");
+      }else{
+        const nb = Math.min(2, Math.max(0.3, brightStart - dy / 220));
+        const v0 = $("#v");
+        if(Math.abs(bright - nb) > 0.004){ bright = nb; v0.style.filter = "brightness(" + nb.toFixed(2) + ")"; }
+        hud("☀️ 亮度 " + Math.round(nb * 100) + "%");
+      }
+      moved = true;
+      return;
+    }
     if(Math.abs(e.clientX - downX) > 12 || Math.abs(e.clientY - downY) > 12){
       moved = true;
       clearTimeout(longTimer);
     }
   });
   wrap.addEventListener("pointerup", e=>{
+    const wasSwipe = !!swipeMode;
+    swipeMode = null;
     if(streamMode !== "trans" || !curItem || grab(e)) return;
     if(endHold()) return;
-    if(moved || Date.now() - downT > 350) return;
+    if(wasSwipe || moved || Date.now() - downT > 350) return;
     const v = $("#v");
     const now = Date.now();
     if(now - lastTap < 320 && Math.abs(e.clientX - lastTapX) < 90){
@@ -2969,7 +3834,7 @@ $("#tfs").addEventListener("click", ()=>{
     lastTap = now; lastTapX = e.clientX;
     if(v.paused) v.play().catch(()=>{}); else v.pause();
   });
-  wrap.addEventListener("pointercancel", ()=>endHold());
+  wrap.addEventListener("pointercancel", ()=>{ swipeMode = null; endHold(); });
 })();
 
 /* ---------------- 暂停浏览：向下滚动时平滑收起视频区，方便逛宫格 ---------------- */
@@ -3158,8 +4023,12 @@ function stopPlayback(){
   v.pause();
   clearTimeout(v.__compatT);
   stopTbar();
+  chromeStop();                // 退出播放：清掉自动隐藏计时
   streamMode = "direct"; transStart = 0; effDur = 0; restarting = false; tbarDrag = false;
   v.controls = true;
+  v.style.filter = "";         // 手势亮度重置
+  bright = 1; subOffset = 0;
+  folderList = null; paintPrevNext();   // 退出播放：收起 ⏮⏭、清掉连播列表
   thumbPaused = false;
   pumpThumbs();
   v.onloadedmetadata = v.ontimeupdate = v.onended = null;
@@ -3171,7 +4040,8 @@ function stopPlayback(){
   forceExpandVwrap();
   $("#resumePill").classList.remove("show");
   document.body.style.overflow = "";
-  $("#practiceRow").style.display = "none";
+  practiceOn = false;
+  $("#tsheet").classList.remove("on");
   if("mediaSession" in navigator){
     try{ navigator.mediaSession.metadata = null; }catch(e){}
   }
@@ -3227,7 +4097,7 @@ $("#mDel").addEventListener("click", ()=>{
   const paths = [...manageSel];
   if(!paths.length){ toast("先勾选要删除的视频"); return; }
   askDialog({
-    title: `永久删除选中的 ${paths.length} 个视频文件？此操作不可恢复。`,
+    title: `删除选中的 ${paths.length} 个视频文件？会先尝试移入系统回收站（可找回；个别盘不支持时将直接删除）。`,
     yes: "删除",
     onOk: async ()=>{
       const r = await fetch("/api/delete", {method:"POST",
@@ -3237,7 +4107,9 @@ $("#mDel").addEventListener("click", ()=>{
       toggleManage(false);
       if(d.ok){
         paths.forEach(p=>delete itemsCache[p]);
-        toast("已删除 " + d.removed + " 个文件" + (d.errors ? "，部分失败" : ""));
+        const nTrash = d.trashed || 0, nDirect = (d.removed || 0) - nTrash;
+        toast("已删除 " + d.removed + " 个文件" + (nTrash ? "（" + nTrash + " 个进了回收站）" : "")
+              + (d.errors ? "，部分失败" : ""));
         openDir(curDir);
       }else toast(d.error || "删除失败");
     },
@@ -3255,6 +4127,7 @@ function refreshRoute(){
   if(wasPlaying) stopPlayback();
   const fm = h.match(/^#\/fav\/([^/]+)$/);
   if(h === "#/fav"){ openFavHome(); return; }
+  if(h === "#/history"){ openHistory(); return; }
   if(fm){ openFavItems(decodeURIComponent(fm[1])); return; }
   const dm = h.match(/^#\/d\/(.*)$/);
   const dir = dm ? decodeURIComponent(dm[1]) : "";
@@ -3305,6 +4178,38 @@ $("#themeBtn").addEventListener("click", ()=>{
 });
 applyTheme(document.documentElement.getAttribute("data-theme") || "dark");
 
+/* ---------------- 桌面键盘快捷键（播放页打开时生效） ---------------- */
+function seekRel(dt){
+  const v = $("#v");
+  if(streamMode === "trans") seekTrans(Math.max(0, vTime() + dt));
+  else v.currentTime = Math.max(0, (v.currentTime || 0) + dt);
+}
+document.addEventListener("keydown", (e)=>{
+  if(!curItem || !$("#player").classList.contains("on")) return;
+  const tgt = e.target || {};
+  const tag = (tgt.tagName || "").toLowerCase();
+  if(tag === "input" || tag === "textarea" || tag === "select" || tgt.isContentEditable) return;
+  if(e.ctrlKey || e.metaKey || e.altKey) return;
+  const v = $("#v");
+  const dur = vDur();
+  const k = e.key;
+  if(k === " " || k === "k" || k === "K"){ e.preventDefault(); if(v.paused) v.play().catch(()=>{}); else v.pause(); }
+  else if(k === "ArrowLeft"){ e.preventDefault(); seekRel(-5); }
+  else if(k === "ArrowRight"){ e.preventDefault(); seekRel(5); }
+  else if(k === "ArrowUp"){ e.preventDefault(); v.muted = false; v.volume = Math.min(1, v.volume + 0.1); hud("🔊 音量 " + Math.round(v.volume * 100) + "%"); }
+  else if(k === "ArrowDown"){ e.preventDefault(); v.volume = Math.max(0, v.volume - 0.1); hud("🔊 音量 " + Math.round(v.volume * 100) + "%"); }
+  else if(k === "m" || k === "M"){ v.muted = !v.muted; toast(v.muted ? "已静音" : "取消静音"); }
+  else if(k === "f" || k === "F"){ $("#tfs").click(); }
+  else if(k === "n" || k === "N"){ jumpEpisode(1); }
+  else if(k === "p" || k === "P"){ jumpEpisode(-1); }
+  else if(k === "Escape"){ stopPlayback(); }
+  else if(/^[0-9]$/.test(k) && dur){
+    e.preventDefault();
+    const target = dur * (parseInt(k, 10) / 10);
+    if(streamMode === "trans") seekTrans(target); else v.currentTime = target;
+  }
+});
+
 refreshRoute();
 </script>
 </body>
@@ -3312,16 +4217,38 @@ refreshRoute();
 """
 
 
+PAGE_HTML = PAGE.replace("__VER__", VERSION).encode("utf-8")
+
+
 # ================================================================ HTTP 服务
+
+class BodyTooLarge(Exception):
+    """请求体超过 64KB 上限。"""
+
 
 class Handler(BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
-    server_version = "LANVideo/3.0"
+    server_version = "LANVideo/" + VERSION
 
     def log_message(self, fmt, *args):  # 静默普通访问日志，只留错误
         pass
 
     # ---------- 基础响应 ----------
+    def end_headers(self):
+        # 统一补安全响应头（每个响应都会走这里，包括 302/416/流式）
+        if not getattr(self, "_security_headers_sent", False):
+            self._security_headers_sent = True
+            self.send_header("X-Content-Type-Options", "nosniff")
+            self.send_header("X-Frame-Options", "SAMEORIGIN")
+            self.send_header("Referrer-Policy", "same-origin")
+            self.send_header(
+                "Content-Security-Policy",
+                "default-src 'self'; img-src 'self' data: blob:; media-src 'self' blob:; "
+                "style-src 'self' 'unsafe-inline'; script-src 'self' 'unsafe-inline'; "
+                "connect-src 'self'; frame-ancestors 'self'; base-uri 'none'; "
+                "form-action 'self'; object-src 'none'")
+        super().end_headers()
+
     def _send(self, code: int, body: bytes, ctype: str, extra: dict | None = None):
         self.send_response(code)
         self.send_header("Content-Type", ctype)
@@ -3341,31 +4268,92 @@ class Handler(BaseHTTPRequestHandler):
         self._send(code, msg.encode("utf-8"), "text/plain; charset=utf-8")
 
     def _params(self) -> dict:
+        """解析 query：用 parse_qs 正确处理 `+`→空格、%XX 与重复键（后者取最后一个）。"""
         q = urllib.parse.urlsplit(self.path).query
-        params = {}
-        for part in q.split("&"):
-            if "=" in part:
-                k, v = part.split("=", 1)
-                params[k] = urllib.parse.unquote(v)
-        return params
+        out = {}
+        for k, vs in urllib.parse.parse_qs(q, keep_blank_values=True).items():
+            if vs:
+                out[k] = vs[-1]
+        return out
 
     def _body_json(self) -> dict:
+        """读 JSON body。超限时先排空再抛 BodyTooLarge，避免残留字节污染 keep-alive。"""
         try:
             n = int(self.headers.get("Content-Length") or 0)
         except ValueError:
+            self.close_connection = True
             return {}
-        if n <= 0 or n > 65536:
+        if n <= 0:
             return {}
+        if n > 65536:
+            self._drain(n)          # 排空后关闭连接，下个请求才不会被当成请求行解析
+            self.close_connection = True
+            raise BodyTooLarge()
         try:
-            return json.loads(self.rfile.read(n).decode("utf-8"))
+            data = json.loads(self.rfile.read(n).decode("utf-8"))
         except (OSError, ValueError):
             return {}
+        return data if isinstance(data, dict) else {}   # 非对象一律当空，调用方无需再判类型
+
+    def _same_origin(self) -> bool:
+        """校验 Origin/Referer 是否指向本机（防 CSRF）。两者都缺省时视为同源
+        （curl 等非浏览器客户端不带这些头，而浏览器跨站表单/请求一定会带 Origin）。
+        Host 也参与比对：DNS rebinding 场景下 Host 是攻击者域名，跨站 Origin 必然不匹配。"""
+        host = (self.headers.get("Host") or "").strip().lower()
+        for hdr in ("Origin", "Referer"):
+            raw = (self.headers.get(hdr) or "").strip()
+            if not raw:
+                continue
+            try:
+                u = urllib.parse.urlsplit(raw)
+            except ValueError:
+                return False
+            netloc = (u.netloc or "").lower()
+            if not netloc:
+                continue                      # Origin: null（sandbox iframe）也走放行分支
+            if not host or netloc != host:
+                return False
+        return True
+
+    def _drain(self, n: int, cap: int = 8 * 1024 * 1024):
+        """丢弃最多 cap 字节的请求体，防止超限 body 残留在连接里。"""
+        left = min(n, cap)
+        try:
+            while left > 0:
+                chunk = self.rfile.read(min(65536, left))
+                if not chunk:
+                    break
+                left -= len(chunk)
+        except OSError:
+            pass
 
     # ---------- 路由 ----------
+    def _ip_blocked(self) -> bool:
+        """白名单之外的来源直接 403，且不泄露任何服务信息。"""
+        if ip_allowed(self.client_address[0]):
+            return False
+        try:
+            body = "Forbidden".encode()
+            self.send_response(403)
+            self.send_header("Content-Type", "text/plain; charset=utf-8")
+            self.send_header("Content-Length", str(len(body)))
+            self.send_header("Connection", "close")
+            self.end_headers()
+            if self.command != "HEAD":
+                self.wfile.write(body)
+        except Exception:
+            pass
+        self.close_connection = True
+        return True
+
     def do_HEAD(self):
+        if self._ip_blocked():
+            return
         self.do_GET()
 
     def do_GET(self):
+        if self._ip_blocked():
+            return
         route = urllib.parse.urlsplit(self.path).path
         try:
             if route == "/login":
@@ -3374,7 +4362,7 @@ class Handler(BaseHTTPRequestHandler):
                 loc = "/login?next=" + urllib.parse.quote(self.path)
                 return self._send(302, b"", "text/html; charset=utf-8", {"Location": loc})
             if route in ("/", "/index.html"):
-                self._send(200, PAGE.encode("utf-8"), "text/html; charset=utf-8")
+                self._send(200, PAGE_HTML, "text/html; charset=utf-8")
             elif route == "/manifest.webmanifest":
                 mani = {"name": "局域网视频站", "short_name": "视频站", "start_url": "/",
                         "display": "standalone", "background_color": "#0a0c10",
@@ -3393,7 +4381,8 @@ class Handler(BaseHTTPRequestHandler):
             elif route == "/api/search":
                 self._json(search(self._params().get("q", "")))
             elif route == "/api/progress":
-                self._json({"ok": True, "p": progress_validated()})
+                p = progress_validated()
+                self._json({"ok": True, "p": p, "gone": progress_take_purged()})
             elif route == "/api/subs":
                 return self.api_subs()
             elif route == "/api/dupes":
@@ -3445,45 +4434,67 @@ class Handler(BaseHTTPRequestHandler):
         except (BrokenPipeError, ConnectionResetError):
             pass  # 手机端拖动进度条时会主动断开，属正常现象
         except Exception as e:
+            # 细节只写服务端日志，回给客户端的是通用文案（避免泄露路径/内部状态）
+            print(f"  ⚠ GET {route} 出错：{type(e).__name__}: {e}", flush=True)
             try:
-                self._error(500, f"服务器内部错误: {e}")
+                self._error(500, "服务器内部错误")
             except Exception:
                 pass
 
     def do_POST(self):
+        if self._ip_blocked():
+            return
         route = urllib.parse.urlsplit(self.path).path
         try:
             if route == "/login":
                 return self.do_login()
             if not auth_ok(self):
                 return self._json({"ok": False, "error": "需要登录"}, 401)
+            # CSRF 防护：带 Origin/Referer 的跨站请求一律拒绝（同源/无头请求放行）
+            if not self._same_origin():
+                return self._json({"ok": False, "error": "跨站请求被拒绝"}, 403)
             if route == "/api/upload":
                 return self.put_upload()
+            if route == "/api/progress/clear":
+                save_progress({})
+                with _PURGE_LOCK:
+                    _PURGED.clear()      # 全清之后不需要再逐个通知前端
+                return self._json({"ok": True})
             if route == "/api/progress":
                 body = self._body_json()
-                t = float(body.get("t") or 0)
-                d = float(body.get("d") or 0)
-                ok = progress_set(str(body.get("path") or ""), t, d)
+                if not isinstance(body, dict):
+                    return self._json({"ok": False, "error": "请求格式错误"}, 400)
+                try:
+                    t = float(body.get("t") or 0)
+                    d = float(body.get("d") or 0)
+                except (TypeError, ValueError):
+                    return self._json({"ok": False, "error": "进度参数无效"}, 400)
+                w = body.get("w")
+                ww = None if w is None else (1 if w in (1, True, "1") else 0)
+                ok = progress_set(str(body.get("path") or ""), t, d, ww)
                 return self._json({"ok": ok})
             if route == "/api/delete":
                 body = self._body_json()
-                paths = body.get("paths")
+                paths = body.get("paths") if isinstance(body, dict) else None
                 if not isinstance(paths, list) or not paths:
                     return self._json({"ok": False, "error": "没有要删除的文件"})
-                removed, errors = 0, []
+                removed, trashed, errors = 0, 0, []
                 for rel in paths[:200]:
                     fs = resolve(str(rel))
                     if fs is None or not os.path.isfile(fs):
                         errors.append(f"{rel}: 不存在或不在播放目录内")
                         continue
                     try:
-                        os.remove(fs)
+                        if recycle_file(fs):
+                            trashed += 1
+                        else:
+                            os.remove(fs)      # 回收站不可用（如部分网络盘）→ 直接删
                         removed += 1
                         FAVS.remove_all(str(rel))          # 收藏里的条目同步清掉
                         progress_delete([str(rel)])        # 观看进度同步清掉
                     except OSError as e:
                         errors.append(f"{rel}: {e}")
-                result = {"ok": True, "removed": removed}
+                result = {"ok": True, "removed": removed, "trashed": trashed}
                 if errors:
                     result["errors"] = errors[:5]
                 return self._json(result)
@@ -3503,7 +4514,9 @@ class Handler(BaseHTTPRequestHandler):
                             os.makedirs(p, exist_ok=True)   # 主页添加：目录不存在就直接建
                             created = True
                         except OSError as e:
-                            return self._json({"ok": False, "error": f"无法创建目录：{e}"})
+                            print(f"  ⚠ 创建目录失败 {p}：{e}", flush=True)
+                            return self._json({"ok": False,
+                                               "error": "无法创建目录（路径无效或没有权限）"})
                     try:
                         entry = LIB.add(p)
                     except ValueError as e:
@@ -3519,19 +4532,21 @@ class Handler(BaseHTTPRequestHandler):
             if route == "/api/rename":
                 body = self._body_json()
                 rel = str(body.get("path") or "")
-                new_name = str(body.get("name") or "").strip().rstrip(" .")
+                raw_name = str(body.get("name") or "")
                 fs_path = resolve(rel)
                 if fs_path is None or not os.path.isfile(fs_path):
                     return self._json({"ok": False, "error": "文件不存在"})
-                if not new_name:
+                if not raw_name.strip():
                     return self._json({"ok": False, "error": "名称为空"})
-                if any(c in new_name for c in '\\/:*?"<>|'):
-                    return self._json({"ok": False, "error": '名称不能包含 \\/:*?"<>| 字符'})
-                if new_name.startswith("."):
-                    return self._json({"ok": False, "error": "名称不能以 . 开头"})
                 _, ext_old = os.path.splitext(fs_path)
+                new_name = raw_name.strip()
                 if not os.path.splitext(new_name)[1]:
                     new_name += ext_old          # 没写扩展名时自动补上原扩展名
+                new_name = safe_filename(new_name)
+                if not new_name:
+                    return self._json({"ok": False,
+                                       "error": '名称非法（不能含 \\/:*?"<>| 或以 . 开头，'
+                                                '也不能用 CON/PRN/NUL 等系统保留名）'})
                 target = os.path.join(os.path.dirname(fs_path), new_name)
                 if os.path.normcase(target) != os.path.normcase(fs_path) \
                         and os.path.exists(target):
@@ -3570,11 +4585,17 @@ class Handler(BaseHTTPRequestHandler):
                 self.put_thumb()
                 return
             self._error(404, "Not Found")
+        except BodyTooLarge:
+            try:
+                self._json({"ok": False, "error": "请求体过大"}, 413)
+            except Exception:
+                pass
         except (BrokenPipeError, ConnectionResetError):
             pass
         except Exception as e:
+            print(f"  ⚠ POST {route} 出错：{type(e).__name__}: {e}", flush=True)
             try:
-                self._error(500, f"服务器内部错误: {e}")
+                self._error(500, "服务器内部错误")
             except Exception:
                 pass
 
@@ -3659,12 +4680,18 @@ class Handler(BaseHTTPRequestHandler):
         name = os.path.basename(params.get("name", "")).strip().lstrip(".")
         if not name:
             return self._error(400, "缺少文件名")
+        # 只接受视频扩展名，避免把 .exe/.bat 之类的东西塞进媒体库
+        if os.path.splitext(name)[1].lower() not in VIDEO_EXTS:
+            return self._error(400, "只能上传视频文件")
         try:
             n = int(self.headers.get("Content-Length") or 0)
         except ValueError:
             n = 0
         if n <= 0:
             return self._error(400, "空文件")
+        if n > MAX_UPLOAD_BYTES:
+            self.close_connection = True
+            return self._error(413, f"文件太大（上限 {MAX_UPLOAD_BYTES // 1073741824} GB）")
         base, ext = os.path.splitext(name)
         cand = os.path.join(fs_dir, name)
         i = 2
@@ -3694,11 +4721,13 @@ class Handler(BaseHTTPRequestHandler):
     # ---------- 访问密码：登录页 ----------
     def send_login_page(self, err=False):
         nxt = self._params().get("next", "/")
-        if not nxt.startswith("/") or nxt.startswith("//"):
+        if not nxt.startswith("/") or nxt.startswith("//") or nxt.startswith("/\\"):
             nxt = "/"
-        html = LOGIN_PAGE.replace("__NEXT__", nxt)
+        # 转义进 HTML 属性，防止 /login?next="><script> 之类的反射型 XSS
+        html = LOGIN_PAGE.replace("__NEXT__", html_escape(nxt, quote=True))
         html = html.replace("<p__ERR__>", '<p class="err">密码不对，再试一次</p>' if err else "<p>")
-        self._send(200 if not err else 401, html.encode("utf-8"), "text/html; charset=utf-8")
+        self._send(200 if not err else 401, html.encode("utf-8"), "text/html; charset=utf-8",
+                   {"Cache-Control": "no-store"})
 
     def do_login(self):
         try:
@@ -3709,13 +4738,28 @@ class Handler(BaseHTTPRequestHandler):
         form = urllib.parse.parse_qs(body)
         pw = (form.get("pw") or [""])[0]
         nxt = (form.get("next") or ["/"])[0]
-        if not nxt.startswith("/") or nxt.startswith("//"):
+        if not nxt.startswith("/") or nxt.startswith("//") or nxt.startswith("/\\"):
             nxt = "/"
-        if hashlib.sha256((AUTH["salt"] + pw).encode("utf-8")).hexdigest() == AUTH["hash"]:
+        ip = self.client_address[0]
+        if not _login_allowed(ip):
+            return self._send(429, "尝试次数过多，请 5 分钟后再试".encode("utf-8"),
+                              "text/plain; charset=utf-8")
+        rounds = AUTH["rounds"] or 0
+        if rounds > 0:
+            ok = hmac.compare_digest(_hash_password(pw, AUTH["salt"], rounds), AUTH["hash"])
+        else:
+            # 旧格式：单轮 sha256(salt+pw)，校验通过后自动升级为 PBKDF2
+            ok = hmac.compare_digest(
+                hashlib.sha256((AUTH["salt"] + pw).encode("utf-8")).hexdigest(), AUTH["hash"])
+            if ok:
+                set_password(pw)
+        if ok:
+            _login_succeeded(ip)
             self._send(303, b"", "text/html; charset=utf-8", {
                 "Location": nxt,
                 "Set-Cookie": f"lvpw={auth_token()}; Path=/; HttpOnly; SameSite=Lax; Max-Age=31536000"})
         else:
+            _login_failed(ip)
             self.send_login_page(err=True)
 
     # ---------- 字幕：列表 / VTT 内容 ----------
@@ -3793,22 +4837,28 @@ class Handler(BaseHTTPRequestHandler):
         range_header = self.headers.get("Range")
         if range_header and size > 0:
             m = re.match(r"bytes=(\d*)-(\d*)$", range_header.strip())
+            rng = None                                # 解析成功时的 (start, end)
             if m:
                 a, b = m.groups()
-                if a == "" and b != "":            # bytes=-N 取末尾 N 字节
+                if a == "" and b != "":               # bytes=-N 取末尾 N 字节
                     n = min(int(b), size)
-                    start, end = size - n, size - 1
-                elif a != "":
-                    start = int(a)
-                    end = int(b) if b else size - 1
-                    if end >= size:
-                        end = size - 1
-                if start >= size:
-                    self.send_response(416)
-                    self.send_header("Content-Range", f"bytes */{size}")
-                    self.end_headers()
-                    return
-                status = 206
+                    if n > 0:
+                        rng = (size - n, size - 1)
+                elif a != "":                          # bytes=N-M / bytes=N-
+                    s0 = int(a)
+                    if s0 >= size:
+                        # 起点越界：RFC 7233 要求 416
+                        self.send_response(416)
+                        self.send_header("Content-Range", f"bytes */{size}")
+                        self.send_header("Content-Length", "0")
+                        self.end_headers()
+                        return
+                    e0 = min(int(b) if b else size - 1, size - 1)
+                    if e0 >= s0:
+                        rng = (s0, e0)
+                    # e0 < s0（bytes=5-2 倒置）不合法 → rng 保持 None，退回 200 全量
+            if rng is not None:
+                start, end, status = rng[0], rng[1], 206
 
         length = end - start + 1 if size > 0 else 0
         self.send_response(status)
@@ -3856,7 +4906,7 @@ class Handler(BaseHTTPRequestHandler):
             self.send_header("Connection", "close")
             self.end_headers()
             return
-        if not _TRANSCODE_SEM.acquire(timeout=30):
+        if not transcode_sem().acquire(timeout=30):
             return self._error(503, "转码通道忙，请稍后再试")
         proc = None
         try:
@@ -3889,7 +4939,7 @@ class Handler(BaseHTTPRequestHandler):
                     proc.stdout.close()
                 except Exception:
                     pass
-            _TRANSCODE_SEM.release()
+            transcode_sem().release()
 
 
 class VideoServer(ThreadingHTTPServer):
@@ -3929,7 +4979,9 @@ def lan_ips() -> list[str]:
     try:
         for info in socket.getaddrinfo(socket.gethostname(), None, socket.AF_INET):
             ip = info[4][0]
-            if ip.startswith(("192.168.", "10.", "172.")):
+            # 172.16.0.0/12 才是私有段，不能只匹配 "172."（会把公网 172.x 也算进来）
+            if ip.startswith(("192.168.", "10.")) or (
+                    ip.startswith("172.") and 16 <= int(ip.split(".")[1]) <= 31):
                 ips.add(ip)
     except OSError:
         pass
@@ -3944,20 +4996,24 @@ HELP_TEXT = """
     ls                    查看当前播放目录列表
     rm 别名                移除某个目录（不删除文件）
     port 端口号            换一个端口监听（如 port 9000，旧端口立即失效）
+    allow                 查看/设置 IP 白名单（allow 192.168.1.0/24,10.0.0.5；allow off 放行全部）
     stat                  状态：目录、视频数、缓存占用
     du                    磁盘占用：各缓存目录 + 每个播放目录的视频总大小
     search 关键词          在所有目录里按文件名搜索视频
     dupes                 按文件大小找疑似重复的视频
     qr                    把手机访问地址生成二维码（终端显示 + 打开图片）
     warm                  立即预热一遍全部目录（提前读文件，降低首次打开延迟）
+    thumb                 给所有视频生成缩略图（后台跑，thumb stop 可中断）
     cc                    清空缩略图/转码缓存与预热记录（浏览网页时自动重建）
+    history               查看播放记录条数（history clear 清空全部记录）
     passwd                查看/设置/关闭网页访问密码（passwd 新密码 / passwd off）
     open                  打开网页界面
     q                     停止服务并退出
     help                  显示本帮助
 """
 
-_NEXT_SERVER = None              # port 命令换端口时暂存新 server，主循环接管
+_NEXT_SERVER = None              # 兼容旧引用，主循环已改用 _SWITCH
+_SWITCH = {"want": None}         # port 命令只登记目标端口，由主线程创建新 server
 _ACTIVE = {"server": None}       # 当前正在服务的 server（open/q 用）
 
 
@@ -3998,21 +5054,53 @@ def console_thread(server):
                 print("  用法：port 端口号（如 port 9000）", flush=True)
                 continue
             port = find_free_port(want)
-            try:
-                nsrv = VideoServer(("0.0.0.0", port), Handler)
-            except OSError as e:
-                print(f"  端口 {want} 无法监听：{e}", flush=True)
-                continue
-            global _NEXT_SERVER
-            _NEXT_SERVER = nsrv
-            _ACTIVE["server"].shutdown()   # 主循环退出旧端口后接管新端口
-            _ACTIVE["server"] = nsrv
-            print(f"  已切换到端口 {port}" + ("（请求的端口被占用，自动顺延）" if port != want else ""),
+            # 只登记意图，真正的换端口在主线程里完成：
+            # serve_forever() 所在线程创建/关闭 socket 才不会出现新旧端口同时失效。
+            _SWITCH["want"] = port
+            print(f"  正在切换到端口 {port}…" + ("（请求的端口被占用，自动顺延）" if port != want else ""),
                   flush=True)
-            ips = lan_ips()
-            print(f"  本机访问  http://localhost:{port}/", flush=True)
-            for ip in ips:
-                print(f"  手机访问  ➜  http://{ip}:{port}/", flush=True)
+            old = _ACTIVE["server"]
+            if old is not None:
+                old.shutdown()          # 让主循环的 serve_forever() 返回
+            continue
+        if low.startswith(("allow ", "白名单 ", "ip ")) or low in ("allow", "白名单", "ip"):
+            arg = line.split(None, 1)[1].strip() if " " in line else ""
+            if not arg:
+                cur = ALLOW["list"]
+                if cur:
+                    print(f"  当前白名单（{len(cur)} 条）：", flush=True)
+                    for r in cur:
+                        print(f"    {r}", flush=True)
+                else:
+                    print("  当前未限制：放行所有 IP", flush=True)
+                print("  用法：allow 192.168.1.0/24,10.0.0.5   |   allow off  恢复放行全部", flush=True)
+                continue
+            if arg.lower() in ("off", "clear", "none", "关闭", "取消"):
+                set_allow([])
+                print("  ✓ 已关闭 IP 白名单，放行所有 IP", flush=True)
+                continue
+            entries = [p for p in re.split(r"[,，\s]+", arg) if p]
+            good = _parse_allow(entries)
+            if not good:
+                print("  没有有效的 IP 或网段，白名单未改动", flush=True)
+                continue
+            set_allow(good)
+            print(f"  ✓ IP 白名单已生效（{len(good)} 条）：", flush=True)
+            for r in good:
+                print(f"    {r}", flush=True)
+            print("  注意：本机 127.0.0.1 也在白名单规则内，若把自己挡在外面请用 allow off", flush=True)
+            continue
+        if low in ("history", "记录", "播放记录") or low.startswith(("history ", "记录 ")):
+            arg = line.split(None, 1)[1].strip().lower() if " " in line else ""
+            data = load_progress()
+            if arg in ("clear", "reset", "清空", "删除"):
+                n = len(data)
+                save_progress({})
+                print(f"  ✓ 已清空 {n} 条播放记录", flush=True)
+                continue
+            alive = sum(1 for k in data if resolve(k) and os.path.isfile(resolve(k) or ""))
+            print(f"  播放记录 {len(data)} 条（文件仍存在 {alive} 条）", flush=True)
+            print("  用法：history clear  清空全部记录", flush=True)
             continue
         if low in ("stat", "状态"):
             for d in LIB.roots():
@@ -4050,6 +5138,25 @@ def console_thread(server):
             with _ENC_LOCK:
                 _PROBE_CACHE.clear()
             print(f"  已清空缩略图/转码缓存，释放 {freed/1048576:.1f} MB（浏览网页时自动重建）", flush=True)
+            continue
+        if low in ("thumb", "thumbs", "缩略图", "封面") or low.startswith(("thumb ", "缩略图 ")):
+            arg = line.split(None, 1)[1].strip().lower() if " " in line else ""
+            if arg in ("stop", "cancel", "停止", "中断"):
+                if _THUMB_BATCH["running"]:
+                    _THUMB_BATCH["stop"] = True
+                    print("  正在停止…（当前这一帧截完就停）", flush=True)
+                else:
+                    print("  当前没有正在运行的缩略图任务", flush=True)
+                continue
+            if _THUMB_BATCH["running"]:
+                print("  已有缩略图任务在跑，用 thumb stop 可以中断", flush=True)
+                continue
+            roots = LIB.roots()
+            if not roots:
+                print("  （还没有目录）", flush=True)
+                continue
+            print("  开始生成全部缩略图（后台进行，可继续输入命令，thumb stop 可中断）…", flush=True)
+            threading.Thread(target=gen_all_thumbs, args=(roots, "手动"), daemon=True).start()
             continue
         if low in ("warm", "预热"):
             roots = LIB.roots()
@@ -4218,7 +5325,7 @@ def main():
     ips = lan_ips()
     print()
     print("═" * 56)
-    print("  🎬 局域网视频站 已启动 · v1.2.0")
+    print(f"  🎬 局域网视频站 已启动 · v{VERSION}")
     print("  播放目录:")
     for d in LIB.roots():
         print(f"      {d['alias']}  ←  {d['path']}")
@@ -4254,13 +5361,30 @@ def main():
                 server.serve_forever()
             except KeyboardInterrupt:
                 break
+            # 到这里 serve_forever() 已返回：要么 q 退出，要么 port 命令要求换端口。
+            # 新 server 一律在本线程（也就是原来 serve_forever 的线程）里创建，
+            # 避免 console 线程提前建好 socket 却因为主循环没接管而让新旧端口同时失效。
+            want = _SWITCH["want"]
+            _SWITCH["want"] = None
+            old_port = server.server_address[1] if server.server_address else 0
             server.server_close()
-            nxt = _NEXT_SERVER
-            if nxt is None:
+            if want is None:
                 break
-            server = nxt
+            try:
+                server = VideoServer(("0.0.0.0", want), Handler)
+            except OSError as e:
+                print(f"  端口 {want} 无法监听：{e}，已退回原端口 {old_port}", flush=True)
+                try:
+                    server = VideoServer(("0.0.0.0", old_port), Handler)
+                except OSError as e2:
+                    print(f"  原端口也无法恢复：{e2}，服务停止", flush=True)
+                    break
             _ACTIVE["server"] = server
-            _NEXT_SERVER = None
+            port = server.server_address[1]
+            print(f"  ✓ 已在端口 {port} 继续服务", flush=True)
+            print(f"  本机访问  http://localhost:{port}/", flush=True)
+            for ip in lan_ips():
+                print(f"  手机访问  ➜  http://{ip}:{port}/", flush=True)
     finally:
         print("\n已停止服务。")
         try:
