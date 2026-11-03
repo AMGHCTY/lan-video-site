@@ -115,20 +115,20 @@ python video_server.py
 ## 便携版（免安装）
 
 便携包**不放在仓库里**（体积大），从 [Releases](https://github.com/AMGHCTY/lan-video-site/releases) 下载，
-**任何 Windows 电脑解压即用**（无需安装 Python）：
+**解压即用**：内置 Python 3.13 运行时与 FFmpeg 7.1，目标电脑不需要装任何东西（Windows 10/11 64 位）。
 
 | 包 | 大小 | 说明 |
 | --- | --- | --- |
-| `lan-video-site-portable-v1.0.3.zip` | ~11 MB | 仅内置 Python，只支持浏览器原生格式 |
-| `lan-video-site-portable-ffmpeg-v1.1.0.zip` | ~40 MB | 内置 Python + 完整 ffmpeg，**全格式实时转码（推荐）** |
+| **[`lan-video-site-portable-ffmpeg-v1.2.0.zip`](https://github.com/AMGHCTY/lan-video-site/releases/download/v1.2.0/lan-video-site-portable-ffmpeg-v1.2.0.zip)** | ~41 MB | **最新推荐**。内置 Python + 完整 ffmpeg，全格式实时转码，代码与仓库主线 v1.2.0 完全一致 |
+| `lan-video-site-portable-ffmpeg-v1.1.0.zip` | ~40 MB | 旧版，代码对应 v1.1.0 |
+| `lan-video-site-portable-v1.0.3.zip` | ~11 MB | 旧版，仅内置 Python，只支持浏览器原生格式 |
 
-> 便携包内的 `video_server.py` 对应 v1.1.0，比本仓库主线略旧；想要最新功能，直接用
-> 本仓库的 `video_server.py` 覆盖便携包里的同名文件即可（依赖仍是同一套）。
+> 想自己搭环境：装好 Python 3.10+ 后直接 `python video_server.py`。ffmpeg 可选，
+> 把 `ffmpeg.exe` 放在 `video_server.py` 旁边（或 `ffmpeg\ffmpeg.exe`）即可启用全格式转码，
+> 建议 Windows 64 位静态构建 7.x（[gyan.dev](https://www.gyan.dev/ffmpeg/builds/) 或
+> [BtbN](https://github.com/BtbN/FFmpeg-Builds/releases)）；找不到时也会尝试系统 PATH 和 imageio_ffmpeg 库。
 
-解压 → 双击「启动视频站.bat」。自搭环境时若想手动配 ffmpeg：把 `ffmpeg.exe` 放在
-`video_server.py` 旁边（或 `ffmpeg\ffmpeg.exe`），建议 Windows 64 位静态构建 7.x
-（[gyan.dev](https://www.gyan.dev/ffmpeg/builds/) 或 [BtbN](https://github.com/BtbN/FFmpeg-Builds/releases)）；
-找不到时也会尝试系统 PATH 和 imageio_ffmpeg 库。
+解压 → 双击「启动视频站.bat」，控制台会打印本机与手机访问地址。
 
 ## 数据与缓存
 
