@@ -1,13 +1,13 @@
 # 代码评审报告 · 局域网视频站
 
-- 评审对象：`E:\aiwork\zcode\wangzan` → 已复制到 `E:\aiwork\deepseek\wangzhan`
+- 评审对象：本项目原始版本（单文件 `video_server.py`）
 - 原始版本：v1.2.0（`video_server.py` 4273 行 / 184 KB，单文件）
 - 第一轮（安全与健壮性修复）：4499 行 / 195 KB，+287 / −61 行
 - 第二轮（功能需求与 UI 调整）：4808 行 / 205 KB
 - 第三轮（播放浮层自动隐藏）：4808 行 / 210 KB
 - 第四轮（缩略图批处理 + 播放记录页 + 分速隐藏）：5079 行 / 222 KB
 - 版本号按用户要求统一为 **v1.2.0**（不再随每次改动递增）
-- 原始文件备份：`video_server.py.orig`
+- 原始文件备份：`git show cbb714f:video_server.py`（本文件即基于该版本）
 - 验证方式：真实启动服务 + 真实 ffmpeg 转码 + HTTP 抓包复现 + headless 浏览器截图，逐条回归
 
 ---
@@ -418,8 +418,8 @@ video_server.py  | 1148 +++++++++++++++++++++++++++++++++++++++++++++++---------
 
 | | 行数 | 字节 |
 | --- | --- | --- |
-| 原始 `video_server.py.orig` | 4273 | 184 423 |
+| 原始版本（`cbb714f`） | 4273 | 184 423 |
 | 现在 `video_server.py` | 5079 | 222 780 |
 
-原文件完整保留在 `video_server.py.orig`，可用 `git diff -- video_server.py` 或
-`fc video_server.py.orig video_server.py` 逐行对照。
+原始版本可直接用 `git show cbb714f:video_server.py` 取出，与当前文件
+`git diff cbb714f -- video_server.py` 逐行对照。
