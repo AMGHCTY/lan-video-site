@@ -1745,8 +1745,6 @@ main{position:relative;z-index:1;max-width:1200px;margin:0 auto;padding:20px 18p
 .vwrap{position:relative;background:#000;overflow:hidden;
   transition:height .36s cubic-bezier(.33,0,.18,1), opacity .36s ease}
 #player.playing .vwrap{position:sticky;top:0;z-index:5}   /* 播放中吸顶；窄屏暂停后下滑可平滑收起 */
-#vblur{position:absolute;inset:0;width:100%;height:100%;object-fit:cover;display:none;
-  filter:blur(26px) saturate(1.15) brightness(.72);transform:scale(1.12)}
 .vwrap video{position:relative;z-index:1;width:100%;max-height:56vh;display:block;
   object-fit:contain;outline:none}
 #back{position:absolute;top:calc(12px + env(safe-area-inset-top));left:14px;z-index:6;
@@ -1788,8 +1786,6 @@ main{position:relative;z-index:1;max-width:1200px;margin:0 auto;padding:20px 18p
   line-height:1.2;white-space:nowrap}
 .tsbtn:active{transform:scale(.95)}
 .tsbtn.on{background:var(--grad);border-color:transparent;font-weight:600}
-.tsinfo{color:rgba(255,255,255,.45);font-size:11px;line-height:1.55;
-  word-break:break-all;white-space:pre-line;flex:1;min-width:0}
 #tsheet .tsclose{align-self:flex-end;background:none;border:none;color:rgba(255,255,255,.6);
   font-size:13px;padding:2px 4px;cursor:pointer}
 #tprog{position:relative;flex:1;height:18px;display:flex;align-items:center;cursor:pointer;touch-action:none}
@@ -1968,7 +1964,6 @@ body.managing .card.sel{outline:2px solid var(--acc);outline-offset:-2px}
 <div id="player">
   <div id="pscroll">
     <div class="vwrap">
-      <canvas id="vblur" width="160" height="90"></canvas>
       <button id="back" title="返回">←</button>
       <video id="v" controls playsinline webkit-playsinline preload="auto"></video>
       <div id="tbar">
@@ -2991,21 +2986,6 @@ async function doSearch(q){
   showSearch(await r.json(), q);
 }
 
-/* ---------------- 播放页 ---------------- */
-const vblur = $("#vblur");
-let lastBlur = 0;
-function drawVblur(force){
-  if(!curItem) return;
-  const v = $("#v");
-  if(!v.videoWidth){ vblur.style.display = "none"; return; }
-  const now = Date.now();
-  if(!force && now - lastBlur < 600) return;   // 节流：约 0.6 秒刷一帧背景
-  lastBlur = now;
-  try{
-    vblur.getContext("2d").drawImage(v, 0, 0, vblur.width, vblur.height);
-    vblur.style.display = "block";
-  }catch(e){}
-}
 
 function vTime(){
   const v = $("#v");
@@ -3155,7 +3135,6 @@ function openPlayerByPath(path){
     }
     v.play().catch(()=>{});
   };
-  v.onloadeddata = ()=> drawVblur(true);   // 首帧就绪后画一次静态模糊背景，播放中保持不变
   v.onplaying = ()=>{
     // 有声无画：手机硬解不了该视频配置时，3.5 秒后自动切实时转码兼容播放
     if(streamMode !== "direct" || !curItem || v.videoWidth){ clearTimeout(v.__compatT); return; }
@@ -3396,10 +3375,10 @@ function buildPlayerRows(){
 
   // 工具：截图 / 练习 / 已看
   const r4 = tsRow("工具");
-  const shot = tsBtn("📸 截图");
+  const shot = tsBtn("截图");
   shot.addEventListener("click", ()=>{ shootFrame(); });
   r4.appendChild(shot);
-  const prac = tsBtn("🎯 练习", practiceOn);
+  const prac = tsBtn("练习", practiceOn);
   prac.addEventListener("click", ()=>{
     practiceOn = !practiceOn;
     renderPractice();
@@ -3440,21 +3419,6 @@ function buildPlayerRows(){
     buildPracticeChips(r5);
     sheet.appendChild(r5);
   }
-
-  // 视频信息：分辨率/编码/大小/路径
-  const d0 = lastInfo || {};
-  const bits = [];
-  if(d0.res) bits.push(d0.res + (d0.fps ? "@" + (Math.abs(d0.fps - Math.round(d0.fps)) < 0.05 ? Math.round(d0.fps) : d0.fps.toFixed(2)) : ""));
-  if(d0.v && d0.v !== "?") bits.push(String(d0.v).toUpperCase());
-  if(d0.a && d0.a !== "?") bits.push(String(d0.a).toUpperCase());
-  if(d0.dur) bits.push(fmtTime(d0.dur));
-  if(d0.size) bits.push(fmtSize(d0.size));
-  const ri = tsRow("信息");
-  const iinfo = document.createElement("span");
-  iinfo.className = "tsinfo";
-  iinfo.textContent = (bits.join(" · ") || "—") + (curItem ? "\n" + curItem.path : "");
-  ri.appendChild(iinfo);
-  sheet.appendChild(ri);
 
   const close = document.createElement("button");
   close.className = "tsclose"; close.type = "button"; close.textContent = "收起";
@@ -3627,7 +3591,7 @@ async function loadMore(path, folder){
    原生控件自动收起"的时机对齐——Chrome/Safari 移动端约 1~1.5 秒。
    暂停、播完、打开设置面板时两个按钮都常显。 */
 const CHROME_BACK_MS = 2500;
-const CHROME_GEAR_MS = 1200;
+const CHROME_GEAR_MS = 800;   // 反馈：齿轮消失更快开始
 let backTimer = null, gearTimer = null;
 let backHidden = false, gearHidden = false, chromeLastWake = 0;
 
@@ -4034,7 +3998,6 @@ function stopPlayback(){
   v.onloadedmetadata = v.ontimeupdate = v.onended = null;
   v.onplay = v.onpause = v.onseeked = v.onseeking = v.onerror = v.onplaying = null;
   v.removeAttribute("src"); v.load();
-  vblur.style.display = "none";
   $("#player").classList.remove("on", "playing");
   document.body.classList.remove("viewing");
   forceExpandVwrap();
