@@ -3000,13 +3000,7 @@ function drawVblur(force){
   if(!force && now - lastBlur < 600) return;   // 节流：约 0.6 秒刷一帧背景
   lastBlur = now;
   try{
-    // cover 裁切：按较大缩放比居中绘制，竖屏视频的背景不会再被横向压扁
-    const cw = vblur.width, ch = vblur.height;
-    const sc = Math.max(cw / v.videoWidth, ch / v.videoHeight);
-    const dw = v.videoWidth * sc, dh = v.videoHeight * sc;
-    const ctx = vblur.getContext("2d");
-    ctx.clearRect(0, 0, cw, ch);
-    ctx.drawImage(v, (cw - dw) / 2, (ch - dh) / 2, dw, dh);
+    vblur.getContext("2d").drawImage(v, 0, 0, vblur.width, vblur.height);
     vblur.style.display = "block";
   }catch(e){}
 }
@@ -3615,10 +3609,10 @@ async function loadMore(path, folder){
    浏览器不暴露原生控件条的显隐状态，没法直接读；这里按"最后一次交互后
    原生控件自动收起"的时机对齐——Chrome/Safari 移动端约 1~1.5 秒。
    暂停、播完、打开设置面板时两个按钮都常显。 */
-const CHROME_BACK_MS = 800;    // 反馈：返回键 0.8 秒隐藏
-const CHROME_GEAR_MS = 0;      // 反馈：齿轮立即隐藏（暂停/设置面板打开时常显）
+const CHROME_BACK_MS = 800;    // 返回键 0.8 秒隐藏
 let backTimer = null, gearTimer = null;
 let backHidden = false, gearHidden = false, chromeLastWake = 0;
+let mouseInWrap = false;       // 鼠标是否悬停在播放画面上（齿轮跟随，不搞定时）
 
 function backShow(){
   if(!backHidden) return;
@@ -3652,10 +3646,15 @@ function chromeWake(){
   if(now - chromeLastWake < 200 && !backHidden && !gearHidden) return;
   chromeLastWake = now;
   backShow();
-  if(CHROME_GEAR_MS > 0) gearShow();   // 延时为 0 时不再先亮出齿轮，避免播放中闪烁
-  clearTimeout(backTimer); clearTimeout(gearTimer);
+  clearTimeout(backTimer);
   backTimer = setTimeout(backHide, CHROME_BACK_MS);
-  gearTimer = setTimeout(gearHide, CHROME_GEAR_MS);
+  updateGearVis();
+}
+function updateGearVis(){
+  // 齿轮跟浏览器自带控件一个逻辑：鼠标停在播放画面上就出现，离开就消失
+  const v = $("#v");
+  if(!curItem || v.paused || v.ended || $("#tsheet").classList.contains("on")){ gearShow(); return; }
+  if(mouseInWrap) gearShow(); else gearHide();
 }
 function chromeStop(){        // 暂停/退出播放：取消计时，按钮常显
   clearTimeout(backTimer); clearTimeout(gearTimer);
@@ -3667,6 +3666,8 @@ function chromeStop(){        // 暂停/退出播放：取消计时，按钮常�
   document.querySelector(".vwrap").addEventListener(ev, chromeWake, {passive:true});
 });
 document.addEventListener("mousemove", chromeWake, {passive:true});
+document.querySelector(".vwrap").addEventListener("pointerenter", ()=>{ mouseInWrap = true; updateGearVis(); });
+document.querySelector(".vwrap").addEventListener("pointerleave", ()=>{ mouseInWrap = false; updateGearVis(); });
 $("#tsheet").addEventListener("pointerdown", chromeShow, {passive:true});
 
 /* ---------------- 转码流的进度条（流式 duration 是 Infinity，系统进度条不可用） ---------------- */

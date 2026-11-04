@@ -3073,13 +3073,7 @@ function drawVblur(force){
   if(!force && now - lastBlur < 600) return;   // 节流：约 0.6 秒刷一帧背景
   lastBlur = now;
   try{
-    // cover 裁切：按较大缩放比居中绘制，竖屏视频的背景不会再被横向压扁
-    const cw = vblur.width, ch = vblur.height;
-    const sc = Math.max(cw / v.videoWidth, ch / v.videoHeight);
-    const dw = v.videoWidth * sc, dh = v.videoHeight * sc;
-    const ctx = vblur.getContext("2d");
-    ctx.clearRect(0, 0, cw, ch);
-    ctx.drawImage(v, (cw - dw) / 2, (ch - dh) / 2, dw, dh);
+    vblur.getContext("2d").drawImage(v, 0, 0, vblur.width, vblur.height);
     vblur.style.display = "block";
   }catch(e){}
 }
