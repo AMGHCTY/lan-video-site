@@ -50,7 +50,7 @@ FASTSTART_EXTS = {".mp4", ".m4v", ".mov"}   # 可虚拟重排索引的容器
 CHUNK = 1024 * 1024                          # 流式传输块大小 1MB
 SEARCH_LIMIT = 300
 MAX_UPLOAD_BYTES = 32 * 1024 * 1024 * 1024   # 单文件上传上限 32GB
-VERSION = "1.2.0"                            # 唯一版本号来源（页头/横幅/Server 头共用）
+VERSION = "1.2.1"                            # 唯一版本号来源（页头/横幅/Server 头共用）
 
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 CONFIG_FILE = os.path.join(SCRIPT_DIR, "library.json")
