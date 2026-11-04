@@ -1745,6 +1745,8 @@ main{position:relative;z-index:1;max-width:1200px;margin:0 auto;padding:20px 18p
 .vwrap{position:relative;background:#000;overflow:hidden;
   transition:height .36s cubic-bezier(.33,0,.18,1), opacity .36s ease}
 #player.playing .vwrap{position:sticky;top:0;z-index:5}   /* 播放中吸顶；窄屏暂停后下滑可平滑收起 */
+#vblur{position:absolute;inset:0;width:100%;height:100%;object-fit:cover;display:none;
+  filter:blur(26px) saturate(1.15) brightness(.72);transform:scale(1.12)}
 .vwrap video{position:relative;z-index:1;width:100%;max-height:56vh;display:block;
   object-fit:contain;outline:none}
 #back{position:absolute;top:calc(12px + env(safe-area-inset-top));left:14px;z-index:6;
@@ -2020,6 +2022,7 @@ body.managing .card.sel{outline:2px solid var(--acc);outline-offset:-2px}
   <div id="pscroll">
     <div class="vwrap">
       <button id="back" title="返回">←</button>
+      <canvas id="vblur" width="160" height="90"></canvas>
       <video id="v" controls playsinline webkit-playsinline preload="auto"></video>
       <div id="cbig" title="播放">
         <svg viewBox="0 0 24 24" fill="currentColor"><path d="M8 5.3v13.4c0 .8.9 1.3 1.6.9l10.6-6.7c.6-.4.6-1.4 0-1.8L9.6 4.4c-.7-.4-1.6.1-1.6.9z"/></svg>
@@ -3060,6 +3063,27 @@ async function doSearch(q){
 }
 
 
+const vblur = $("#vblur");
+let lastBlur = 0;
+function drawVblur(force){
+  if(!curItem) return;
+  const v = $("#v");
+  if(!v.videoWidth){ vblur.style.display = "none"; return; }
+  const now = Date.now();
+  if(!force && now - lastBlur < 600) return;   // 节流：约 0.6 秒刷一帧背景
+  lastBlur = now;
+  try{
+    // cover 裁切：按较大缩放比居中绘制，竖屏视频的背景不会再被横向压扁
+    const cw = vblur.width, ch = vblur.height;
+    const sc = Math.max(cw / v.videoWidth, ch / v.videoHeight);
+    const dw = v.videoWidth * sc, dh = v.videoHeight * sc;
+    const ctx = vblur.getContext("2d");
+    ctx.clearRect(0, 0, cw, ch);
+    ctx.drawImage(v, (cw - dw) / 2, (ch - dh) / 2, dw, dh);
+    vblur.style.display = "block";
+  }catch(e){}
+}
+
 function vTime(){
   const v = $("#v");
   return streamMode === "trans" ? transStart + (v.currentTime || 0) : v.currentTime;
@@ -3280,6 +3304,7 @@ function openPlayerByPath(path){
     $("#player").classList.remove("playing");   // 暂停后取消吸顶，下滑可收起视频区
     updatePausedView();
   };
+  v.onloadeddata = ()=> drawVblur(true);   // 首帧就绪后画一次静态模糊背景，播放中保持不变
   v.onwaiting = ()=>{ $("#cspin").classList.add("show"); };
   v.onplaying = ()=>{ $("#cspin").classList.remove("show"); };
   v.oncanplay = ()=>{ $("#cspin").classList.remove("show"); };
@@ -4193,6 +4218,7 @@ function stopPlayback(){
   v.onplay = v.onpause = v.onseeked = v.onseeking = v.onerror = v.onplaying = v.onwaiting = v.oncanplay = null;
   $("#cbig").classList.remove("show");
   $("#cspin").classList.remove("show");
+  vblur.style.display = "none";
   v.removeAttribute("src"); v.load();
   $("#player").classList.remove("on", "playing");
   document.body.classList.remove("viewing");
