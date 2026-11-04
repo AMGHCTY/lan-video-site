@@ -3702,8 +3702,8 @@ async function loadMore(path, folder){
    浏览器不暴露原生控件条的显隐状态，没法直接读；这里按"最后一次交互后
    原生控件自动收起"的时机对齐——Chrome/Safari 移动端约 1~1.5 秒。
    暂停、播完、打开设置面板时两个按钮都常显。 */
-const CHROME_BACK_MS = 2500;
-const CHROME_GEAR_MS = 800;   // 反馈：齿轮消失更快开始
+const CHROME_BACK_MS = 800;   // 反馈：返回键与控制条都 0.8 秒隐藏
+const CHROME_GEAR_MS = 800;   // 控制条（含齿轮）跟随同一节奏，保留可读的进度条
 let backTimer = null, gearTimer = null;
 let backHidden = false, gearHidden = false, chromeLastWake = 0;
 
@@ -3738,7 +3738,8 @@ function chromeWake(){
   const now = Date.now();
   if(now - chromeLastWake < 200 && !backHidden && !gearHidden) return;
   chromeLastWake = now;
-  chromeShow();
+  backShow();
+  if(CHROME_GEAR_MS > 0) gearShow();   // 延时为 0 时不再先亮出齿轮，避免播放中闪烁
   clearTimeout(backTimer); clearTimeout(gearTimer);
   backTimer = setTimeout(backHide, CHROME_BACK_MS);
   gearTimer = setTimeout(gearHide, CHROME_GEAR_MS);
