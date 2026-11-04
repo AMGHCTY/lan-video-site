@@ -2061,7 +2061,6 @@ let autoNext = true;          // 自动连播：播完接同文件夹下一个�
 try{ autoNext = localStorage.getItem("lan_video_autonext") !== "0"; }catch(e){}
 let folderList = null;        // 当前视频所在文件夹的播放列表（上一集/下一集/连播用）
 let subOffset = 0;            // 字幕延迟（秒），每个视频重置
-let bright = 1;               // 手势调的亮度（CSS filter），每个视频重置
 let hudLast = 0;              // 音量/亮度 HUD 节流
 function hud(msg){
   const n = Date.now();
@@ -3096,8 +3095,7 @@ function openPlayerByPath(path){
   stopTbar();
   v.controls = true;
   v.classList.remove("mirror");           // 镜像/字幕轨/练习循环每个视频重新开始
-  v.style.filter = "";                    // 手势亮度也重置
-  bright = 1; subOffset = 0;
+  subOffset = 0;
   v.querySelectorAll("track").forEach(t=>t.remove());
   abA = abB = -1;
   practiceOn = false;
@@ -3747,7 +3745,6 @@ $("#tfs").addEventListener("click", ()=>{
   let downT = 0, downX = 0, downY = 0, moved = false;
   let longTimer = null, longFired = false;
   let lastTap = 0, lastTapX = 0;
-  let swipeMode = null, volStart = 1, brightStart = 1;   // 垂直滑动手势：右半区音量 / 左半区亮度
   const grab = e => e.target.closest && e.target.closest("#tbar,#tsheet,#tset,#back,button");
   const endHold = ()=>{
     clearTimeout(longTimer);
@@ -3762,7 +3759,7 @@ $("#tfs").addEventListener("click", ()=>{
   wrap.addEventListener("pointerdown", e=>{
     if(streamMode !== "trans" || !curItem || grab(e)) return;
     downT = Date.now(); downX = e.clientX; downY = e.clientY;
-    moved = false; longFired = false; swipeMode = null;
+    moved = false; longFired = false;
     clearTimeout(longTimer);
     longTimer = setTimeout(()=>{
       const v = $("#v");
@@ -3775,43 +3772,15 @@ $("#tfs").addEventListener("click", ()=>{
     }, 500);
   });
   wrap.addEventListener("pointermove", e=>{
-    if(downT && !swipeMode && Date.now() - downT > 140){
-      const dx = e.clientX - downX, dy = e.clientY - downY;
-      if(Math.abs(dy) > 28 && Math.abs(dy) > Math.abs(dx) * 1.3){
-        const rect = wrap.getBoundingClientRect();
-        const relX = (downX - rect.left) / rect.width;
-        swipeMode = relX >= 0.4 ? "vol" : "bright";   // 右侧调音量，左侧调亮度
-        volStart = $("#v").volume; brightStart = bright;
-        clearTimeout(longTimer);
-      }
-    }
-    if(swipeMode){
-      const dy = e.clientY - downY;
-      if(swipeMode === "vol"){
-        const nv = Math.min(1, Math.max(0, volStart - dy / 220));
-        const v0 = $("#v");
-        if(Math.abs(v0.volume - nv) > 0.004){ v0.volume = nv; v0.muted = false; }
-        hud("🔊 音量 " + Math.round(nv * 100) + "%");
-      }else{
-        const nb = Math.min(2, Math.max(0.3, brightStart - dy / 220));
-        const v0 = $("#v");
-        if(Math.abs(bright - nb) > 0.004){ bright = nb; v0.style.filter = "brightness(" + nb.toFixed(2) + ")"; }
-        hud("☀️ 亮度 " + Math.round(nb * 100) + "%");
-      }
-      moved = true;
-      return;
-    }
     if(Math.abs(e.clientX - downX) > 12 || Math.abs(e.clientY - downY) > 12){
       moved = true;
       clearTimeout(longTimer);
     }
   });
   wrap.addEventListener("pointerup", e=>{
-    const wasSwipe = !!swipeMode;
-    swipeMode = null;
     if(streamMode !== "trans" || !curItem || grab(e)) return;
     if(endHold()) return;
-    if(wasSwipe || moved || Date.now() - downT > 350) return;
+    if(moved || Date.now() - downT > 350) return;
     const v = $("#v");
     const now = Date.now();
     if(now - lastTap < 320 && Math.abs(e.clientX - lastTapX) < 90){
@@ -3825,7 +3794,7 @@ $("#tfs").addEventListener("click", ()=>{
     lastTap = now; lastTapX = e.clientX;
     if(v.paused) v.play().catch(()=>{}); else v.pause();
   });
-  wrap.addEventListener("pointercancel", ()=>{ swipeMode = null; endHold(); });
+  wrap.addEventListener("pointercancel", ()=>{ endHold(); });
 })();
 
 /* ---------------- 暂停浏览：向下滚动时平滑收起视频区，方便逛宫格 ---------------- */
@@ -4017,8 +3986,7 @@ function stopPlayback(){
   chromeStop();                // 退出播放：清掉自动隐藏计时
   streamMode = "direct"; transStart = 0; effDur = 0; restarting = false; tbarDrag = false;
   v.controls = true;
-  v.style.filter = "";         // 手势亮度重置
-  bright = 1; subOffset = 0;
+  subOffset = 0;
   folderList = null; paintPrevNext();   // 退出播放：收起 ⏮⏭、清掉连播列表
   thumbPaused = false;
   pumpThumbs();
